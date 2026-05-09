@@ -231,7 +231,8 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 				return messages, AgentInterrupted{}
 			}
 			logEvent("tool_call", map[string]any{"id": tu.ID, "name": tu.Name, "input": tu.Input})
-			result := dispatchTool(ctx, cfg, tu, sessionPath)
+			result := dispatchTool(ctx, cfg, tu.Name, tu.Input)
+			result.ToolUseID = tu.ID
 			logEvent("tool_result", map[string]any{
 				"id":       tu.ID,
 				"name":     tu.Name,
@@ -247,45 +248,44 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 	return messages, nil
 }
 
-func dispatchTool(ctx context.Context, cfg AgentConfig, tu provider.ContentBlock, sessionPath string) provider.ContentBlock {
+func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[string]any) provider.ContentBlock {
 	var output string
 	var isErr bool
 
-	switch tu.Name {
+	switch name {
 	case "bash":
-		result := tools.Bash(ctx, cfg.CWD, stringInput(tu.Input, "cmd"), numberInput(tu.Input, "timeout"))
+		result := tools.Bash(ctx, cfg.CWD, stringInput(input, "cmd"), numberInput(input, "timeout"))
 		output, isErr = result.Output, result.IsError
 	case "read":
-		result := tools.Read(ctx, cfg.CWD, stringInput(tu.Input, "path"), intInput(tu.Input, "offset"), intInput(tu.Input, "limit"))
+		result := tools.Read(ctx, cfg.CWD, stringInput(input, "path"), intInput(input, "offset"), intInput(input, "limit"))
 		output, isErr = result.Output, result.IsError
 	case "write":
-		result := tools.Write(ctx, cfg.CWD, stringInput(tu.Input, "path"), stringInput(tu.Input, "content"))
+		result := tools.Write(ctx, cfg.CWD, stringInput(input, "path"), stringInput(input, "content"))
 		output, isErr = result.Output, result.IsError
 	case "edit":
-		result := tools.Edit(ctx, cfg.CWD, stringInput(tu.Input, "path"), stringInputAny(tu.Input, "old_text", "oldText"), stringInputAny(tu.Input, "new_text", "newText"), editInputs(tu.Input))
+		result := tools.Edit(ctx, cfg.CWD, stringInput(input, "path"), stringInputAny(input, "old_text", "oldText"), stringInputAny(input, "new_text", "newText"), editInputs(input))
 		output, isErr = result.Output, result.IsError
 	case "memory_write":
-		output = memory.HandleMemoryWrite(cfg.SessionID, tu.Input, cfg.CWD)
+		output = memory.HandleMemoryWrite(cfg.SessionID, input, cfg.CWD)
 		isErr = strings.Contains(strings.ToLower(output), "error")
 	case "memory_search":
-		query := stringInput(tu.Input, "query")
-		results, err := memory.Search(query, intInputAny(tu.Input, "top_k", "topK"), stringInput(tu.Input, "kind"), cfg.CWD)
+		query := stringInput(input, "query")
+		results, err := memory.Search(query, intInputAny(input, "top_k", "topK"), stringInput(input, "kind"), cfg.CWD)
 		if err != nil {
 			output, isErr = fmt.Sprintf("memory search error: %v", err), true
 		} else {
 			output = memory.FormatResults(results, query)
 		}
 	case "recall_compaction":
-		output, isErr = recallCompaction(sessionPath, stringInput(tu.Input, "id"))
+		output, isErr = recallCompaction(currentSessionPath(cfg), stringInput(input, "id"))
 	default:
-		output, isErr = fmt.Sprintf("unknown tool: %s", tu.Name), true
+		output, isErr = fmt.Sprintf("unknown tool: %s", name), true
 	}
 
 	return provider.ContentBlock{
-		Type:      "tool_result",
-		ToolUseID: tu.ID,
-		Content:   output,
-		IsError:   isErr,
+		Type:    "tool_result",
+		Content: output,
+		IsError: isErr,
 	}
 }
 
