@@ -39,6 +39,7 @@ var (
 	lastUsage    = provider.LastUsage
 	routeTurn    = router.RouteTurn
 	setenv       = os.Setenv
+	runTUIApp    = runTUI
 )
 
 func main() {
@@ -72,8 +73,10 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 
 	var sessionID string
 	var showVersion bool
+	var useTUI bool
 	fs.StringVar(&sessionID, "s", "", "named session id")
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")
+	fs.BoolVar(&useTUI, "tui", false, "start terminal UI")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -84,6 +87,13 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 
 	if err := startupChecks(errOut); err != nil {
 		return 1
+	}
+	if useTUI {
+		if err := runTUIApp(sessionID); err != nil {
+			fmt.Fprintf(errOut, "mimicode: tui: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 
 	cwd, err := getwd()
