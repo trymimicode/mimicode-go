@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/trymimicode/mimicode-go/internal/agent"
@@ -288,22 +289,81 @@ func (m *model) replaceStreamingAssistant() {
 func (m *model) renderedLines() []string {
 	var out []string
 	for _, l := range m.lines {
-		for _, physical := range strings.Split(l.Text, "\n") {
-			switch l.Kind {
-			case "user":
-				out = append(out, userStyle.Render("user: "+physical))
-			case "assistant", "assistant_stream":
-				out = append(out, assistantStyle.Render("assistant: "+physical))
-			case "tool":
-				out = append(out, toolStyle.Render(physical))
-			case "error":
-				out = append(out, errorStyle.Render(physical))
-			default:
-				out = append(out, physical)
+		switch l.Kind {
+		case "assistant", "assistant_stream":
+			rendered := renderMarkdown(l.Text, m.width)
+			rendered = strings.TrimLeft(rendered, "\n")
+			lines := strings.Split(rendered, "\n")
+			dotPlaced := false
+			for _, physical := range lines {
+				if !dotPlaced && strings.TrimSpace(physical) != "" {
+					out = append(out, assistantStyle.Render("● ")+physical)
+					dotPlaced = true
+				} else {
+					out = append(out, physical)
+				}
+			}
+		default:
+			for _, physical := range strings.Split(l.Text, "\n") {
+				switch l.Kind {
+				case "user":
+					wrapped := wrapText("you: "+physical, m.width-2)
+					for _, wl := range strings.Split(wrapped, "\n") {
+						out = append(out, userStyle.Render(wl))
+					}
+				case "tool":
+					out = append(out, toolStyle.Render(physical))
+				case "error":
+					out = append(out, errorStyle.Render(physical))
+				default:
+					out = append(out, physical)
+				}
 			}
 		}
 	}
 	return out
+}
+
+func renderMarkdown(text string, width int) string {
+	w := width - 4
+	if w < 20 {
+		w = 80
+	}
+	r, err := glamour.NewTermRenderer(
+		glamour.WithStandardStyle("dark"),
+		glamour.WithWordWrap(w),
+	)
+	if err != nil {
+		return assistantStyle.Render(text)
+	}
+	out, err := r.Render(text)
+	if err != nil {
+		return assistantStyle.Render(text)
+	}
+	return strings.TrimRight(out, "\n")
+}
+
+func wrapText(text string, width int) string {
+	if width <= 0 || len(text) <= width {
+		return text
+	}
+	var result strings.Builder
+	words := strings.Fields(text)
+	lineLen := 0
+	for i, word := range words {
+		if i > 0 {
+			if lineLen+1+len(word) > width {
+				result.WriteByte('\n')
+				lineLen = 0
+			} else {
+				result.WriteByte(' ')
+				lineLen++
+			}
+		}
+		result.WriteString(word)
+		lineLen += len(word)
+	}
+	return result.String()
 }
 
 func (m *model) clampScroll() {
