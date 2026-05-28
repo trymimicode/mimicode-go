@@ -82,6 +82,18 @@ type AgentInterrupted struct{}
 
 func (AgentInterrupted) Error() string { return "agent interrupted" }
 
+// AgentStuck signals the loop detected a failure pattern (repeated identical
+// tool calls, a run of tool errors, or exhausting the step budget) and gave up
+// so the caller can run a clean-context recovery diagnosis.
+type AgentStuck struct{ Reason string }
+
+func (s AgentStuck) Error() string { return "agent stuck: " + s.Reason }
+
+const (
+	repeatedCallLimit = 3 // same tool+input N times → stuck
+	consecErrorLimit  = 4 // N tool errors in a row → stuck
+)
+
 var (
 	callClaude          = provider.CallClaude
 	callClaudeStreaming = provider.CallClaudeStreaming
@@ -264,6 +276,9 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 		sessionDir = cfg.Session.Path()
 	}
 
+	callCounts := map[string]int{}
+	consecErrors := 0
+
 	for step := 0; step < cfg.MaxSteps; step++ {
 		if err := ctx.Err(); err != nil {
 			return messages, AgentInterrupted{}
@@ -309,6 +324,7 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 		}
 
 		results := make([]provider.ContentBlock, 0, len(toolUses))
+		stuck := ""
 		for _, tu := range toolUses {
 			if err := ctx.Err(); err != nil {
 				return messages, AgentInterrupted{}
@@ -335,15 +351,45 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 				})
 			}
 			results = append(results, result)
+
+			sig := tu.Name + "|" + callSignature(tu.Input)
+			callCounts[sig]++
+			if callCounts[sig] >= repeatedCallLimit {
+				stuck = fmt.Sprintf("repeated the same %s call %d times without progress", tu.Name, callCounts[sig])
+			}
+			if result.IsError {
+				consecErrors++
+			} else {
+				consecErrors = 0
+			}
+			if consecErrors >= consecErrorLimit {
+				stuck = fmt.Sprintf("%d consecutive tool errors", consecErrors)
+			}
 		}
 		messages = append(messages, provider.Message{Role: "user", Content: results})
+
+		if stuck != "" {
+			if cfg.Session != nil {
+				cfg.Session.LogTurnEnd(turn, step+1, "stuck:"+stuck)
+			}
+			repomap.RefreshAsync(cfg.CWD)
+			return messages, AgentStuck{Reason: stuck}
+		}
 	}
 
 	if cfg.Session != nil {
 		cfg.Session.LogTurnEnd(turn, cfg.MaxSteps, "max_steps")
 	}
 	repomap.RefreshAsync(cfg.CWD)
-	return messages, nil
+	return messages, AgentStuck{Reason: fmt.Sprintf("hit the %d-step budget without finishing", cfg.MaxSteps)}
+}
+
+func callSignature(input map[string]any) string {
+	b, err := json.Marshal(input)
+	if err != nil {
+		return fmt.Sprintf("%v", input)
+	}
+	return string(b)
 }
 
 func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[string]any) provider.ContentBlock {
@@ -562,4 +608,12 @@ func recallCompaction(sessionDir, id string) (string, bool) {
 func IsInterrupted(err error) bool {
 	var interrupted AgentInterrupted
 	return errors.As(err, &interrupted)
+}
+
+func IsStuck(err error) (AgentStuck, bool) {
+	var stuck AgentStuck
+	if errors.As(err, &stuck) {
+		return stuck, true
+	}
+	return AgentStuck{}, false
 }

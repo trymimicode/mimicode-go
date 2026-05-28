@@ -18,7 +18,9 @@ import (
 	"github.com/trymimicode/mimicode-go/internal/agent"
 	"github.com/trymimicode/mimicode-go/internal/checkpoint"
 	"github.com/trymimicode/mimicode-go/internal/compactor"
+	"github.com/trymimicode/mimicode-go/internal/memory"
 	"github.com/trymimicode/mimicode-go/internal/provider"
+	"github.com/trymimicode/mimicode-go/internal/recovery"
 	reflectpkg "github.com/trymimicode/mimicode-go/internal/reflect"
 	"github.com/trymimicode/mimicode-go/internal/repomap"
 	"github.com/trymimicode/mimicode-go/internal/store"
@@ -134,6 +136,16 @@ func runOneShot(ctx context.Context, sessionID, cwd, prompt string, out, errOut 
 	cfg := agent.AgentConfig{CWD: cwd, Session: sess, MaxSteps: 25}
 	var err error
 	messages, err = agentTurn(ctx, cfg, prompt, messages)
+	if stuck, ok := agent.IsStuck(err); ok {
+		_ = sess.SaveMessages(messages)
+		if diag, derr := recovery.Diagnose(ctx, sess, stuck.Reason); derr == nil {
+			fmt.Fprint(errOut, diag.Format())
+			fmt.Fprintln(errOut, "  (one-shot: not auto-applied — rerun in REPL to recover)")
+		} else {
+			fmt.Fprintf(errOut, "mimicode: stuck: %s\n", stuck.Reason)
+		}
+		return 1
+	}
 	if err != nil {
 		printAgentErr(errOut, err)
 		return 1
@@ -193,8 +205,23 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 		}
 
 		printTurnStart(errOut, sess)
+		before := append([]provider.Message(nil), messages...)
 		var turnErr error
 		messages, turnErr = agentTurn(ctx, cfg, prompt, messages)
+		if stuck, ok := agent.IsStuck(turnErr); ok {
+			recoveryPrompt, apply := proposeRecovery(ctx, reader, sess, cwd, cp, prompt, stuck, errOut)
+			if !apply {
+				_ = sess.SaveMessages(messages)
+				continue
+			}
+			messages = before // clean context: drop the failed turn, retry fresh
+			messages, turnErr = agentTurn(ctx, cfg, recoveryPrompt, messages)
+			if stuck2, ok := agent.IsStuck(turnErr); ok {
+				fmt.Fprintf(errOut, "recovery attempt still stuck: %s\n", stuck2.Reason)
+				_ = sess.SaveMessages(messages)
+				continue
+			}
+		}
 		if turnErr != nil {
 			printAgentErr(errOut, turnErr)
 			if agent.IsInterrupted(turnErr) {
@@ -340,6 +367,55 @@ func firstLine(s string, max int) string {
 		s = s[:max] + "…"
 	}
 	return s
+}
+
+// proposeRecovery diagnoses a stuck turn from the event log, shows it, and asks
+// the engineer whether to apply. Returns the recovery prompt and whether to retry.
+func proposeRecovery(ctx context.Context, reader *bufio.Reader, sess *store.Session, cwd string, cp *checkpoint.Checkpointer, originalPrompt string, stuck agent.AgentStuck, errOut io.Writer) (string, bool) {
+	diag, err := recovery.Diagnose(ctx, sess, stuck.Reason)
+	if err != nil {
+		fmt.Fprintf(errOut, "recovery: diagnosis failed: %v\n", err)
+		return "", false
+	}
+	fmt.Fprint(errOut, diag.Format())
+	fmt.Fprint(errOut, "  apply recovery? [y]es retry / [r]ule only / [n]o: ")
+
+	line, _ := reader.ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		if diag.Rule != "" {
+			if err := memory.AppendRule(cwd, diag.Rule); err != nil {
+				fmt.Fprintf(errOut, "  warning: could not write rule: %v\n", err)
+			} else {
+				fmt.Fprintln(errOut, "  rule added to .mimi/RULES.md")
+			}
+		}
+		cp.Snapshot("before recovery retry")
+		fmt.Fprintln(errOut, "  resetting to a clean context and retrying…")
+		return buildRecoveryPrompt(originalPrompt, diag), true
+	case "r", "rule":
+		if diag.Rule != "" {
+			if err := memory.AppendRule(cwd, diag.Rule); err != nil {
+				fmt.Fprintf(errOut, "  warning: could not write rule: %v\n", err)
+			} else {
+				fmt.Fprintln(errOut, "  rule added to .mimi/RULES.md (no retry)")
+			}
+		}
+		return "", false
+	default:
+		fmt.Fprintln(errOut, "  recovery skipped")
+		return "", false
+	}
+}
+
+func buildRecoveryPrompt(originalPrompt string, diag recovery.Diagnosis) string {
+	var b strings.Builder
+	b.WriteString(originalPrompt)
+	fmt.Fprintf(&b, "\n\n[recovery] A previous attempt got stuck. Root cause: %s", diag.WentWrong)
+	if diag.Instruction != "" {
+		fmt.Fprintf(&b, " Take a different approach: %s", diag.Instruction)
+	}
+	return b.String()
 }
 
 func printAgentErr(errOut io.Writer, err error) {
