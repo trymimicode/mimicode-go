@@ -123,7 +123,7 @@ func extractDDGResult(n *html.Node) (ddgResult, bool) {
 		if node.Type == html.ElementNode {
 			if node.Data == "a" && hasHTMLClass(node, "result__a") {
 				r.title = strings.TrimSpace(nodeText(node))
-				r.u = htmlAttr(node, "href")
+				r.u = cleanDDGHref(htmlAttr(node, "href"))
 			}
 			if hasHTMLClass(node, "result__snippet") {
 				r.snippet = strings.TrimSpace(nodeText(node))
@@ -135,6 +135,27 @@ func extractDDGResult(n *html.Node) (ddgResult, bool) {
 	}
 	walk(n)
 	return r, r.title != "" && r.u != ""
+}
+
+// cleanDDGHref unwraps DuckDuckGo's /l/?uddg= redirect into the real target URL.
+// DDG result links look like: //duckduckgo.com/l/?uddg=<urlencoded-target>&rut=...
+func cleanDDGHref(href string) string {
+	if href == "" {
+		return href
+	}
+	if strings.HasPrefix(href, "//") {
+		href = "https:" + href
+	}
+	u, err := url.Parse(href)
+	if err != nil {
+		return href
+	}
+	if strings.Contains(u.Host, "duckduckgo.com") && strings.HasPrefix(u.Path, "/l/") {
+		if target := u.Query().Get("uddg"); target != "" {
+			return target
+		}
+	}
+	return href
 }
 
 // WebFetch fetches a URL and returns its main text.
@@ -242,7 +263,7 @@ func fetchGitHubIssue(ctx context.Context, rawURL string) ToolResult {
 	}
 	user := jsonMap(data, "user")
 	text := fmt.Sprintf("# %s\nby @%s | state: %s\n\n%s",
-		jsonStr(data, "title"), jsonStr(user, "login"), jsonStr(data, "state"), jsonStr(data, "body"))
+		jsonStr(data, "title"), jsonStr(user, "login"), jsonStr(data, "state"), stripHTML(jsonStr(data, "body")))
 	return ToolResult{Output: truncateWebBytes(text)}
 }
 
