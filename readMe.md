@@ -52,7 +52,30 @@ mimicode --tui -s myfeature
 ```
 
 Sessions are resumable. `-s <name>` names a session; omit it for an anonymous one.
-Conversation history is saved to `.mimi/sessions/`.
+Conversation history is saved under `~/.mimi/sessions/<id>/`.
+
+---
+
+## checkpoints & undo
+
+Every turn that changes files is snapshotted into a shadow git repo (in the
+session dir, work-tree pointed at your project). Your real `.git` is never
+touched — no stray commits, no dirtied history.
+
+```
+> Add a Sub function to calc.go.
+checkpoint eb33e84 — turn 1: Add a Sub function to calc.go.
+
+> :undo            # revert the last turn
+reverted to: session start
+
+> :undo 3          # revert the last 3 turns
+> :undo list       # show all checkpoints this session
+```
+
+`:undo` restores the working tree; it never deletes work irrecoverably
+(reset commits stay reachable via `git reflog` in the shadow repo). Disable
+with `MIMICODE_CHECKPOINT=0`.
 
 ---
 
@@ -73,21 +96,28 @@ mimi has ten tools. That is the entire surface area.
 | `memory_search` | FTS5 search across sessions, memory, and rules |
 | `recall_compaction` | loads a prior compaction summary |
 
-mimi routes turns between Haiku (fast, cheap) and Sonnet (reasoning) based on
-what the task actually needs. It never switches mid-turn — that would break prompt
-cache and waste money.
+mimi defaults to Sonnet. You pick the model — set `MIMICODE_MODEL` to override
+(e.g. the cheaper Haiku). No hidden routing: the engineer decides, not a regex.
 
 ---
 
 ## audit trail
 
 ```
-.mimi/
-  sessions/<id>.jsonl          # every action, timestamped
-  sessions/<id>.messages.json  # full conversation for resume
-  MEMORY.md                    # cross-session notes (readable markdown)
-  RULES.md                     # behavioral rules learned from past sessions
+~/.mimi/sessions/<id>/
+  events.jsonl        # every decision: model text, tool calls, tokens, ms
+  messages.json       # full conversation for resume
+  checkpoints.git/    # shadow repo backing :undo
+  compactions.jsonl   # compaction summaries
+
+<project>/.mimi/
+  MEMORY.md           # cross-session notes (readable markdown)
+  RULES.md            # behavioral rules learned from past sessions
 ```
+
+The `events.jsonl` trace is the point: each step records the model's own text,
+the tool calls it made with full inputs, the token split (in/out/cache), and
+timing. You can replay exactly how mimi decided — nothing is hidden.
 
 After each session, mimi runs a Haiku call to summarize what happened and appends
 it to `MEMORY.md`. That summary is injected into the system prompt next time.
@@ -100,6 +130,8 @@ The loop adapts to your codebase and your workflow over time.
 | env var | default | description |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | required | Anthropic API key |
+| `MIMICODE_MODEL` | Sonnet | model id to use for every turn |
+| `MIMICODE_CHECKPOINT` | `1` | set `0` to disable turn checkpoints / `:undo` |
 | `MIMICODE_MAX_STEPS` | `25` | max tool calls per turn |
 | `MIMICODE_COMPACT_AUTO` | `true` | auto-compact long sessions |
 | `MIMICODE_COMPACT_TURN_INTERVAL` | `5` | turns between compaction checks |
