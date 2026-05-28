@@ -79,6 +79,33 @@ with `MIMICODE_CHECKPOINT=0`.
 
 ---
 
+## self-recovery
+
+When mimi gets stuck — repeating the same failing tool call, a run of errors,
+or burning the step budget without finishing — it stops and diagnoses itself.
+A fresh, clean model call reads the `events.jsonl` decision trace, works out
+the root cause, and proposes a fix plus a durable rule. **It asks before acting**
+— nothing is applied without your confirmation.
+
+```
+⚠ mimi got stuck.
+  what went wrong: exhausted the step budget after editing but never ran the tests.
+  recovery plan:   batch the test + vet into one command, then summarize.
+  proposed rule:   For multi-step tasks, batch independent ops into one tool call.
+  apply recovery? [y]es retry / [r]ule only / [n]o:
+```
+
+- **y** — append the rule to `.mimi/RULES.md`, checkpoint, reset to a *clean
+  context* seeded only with the task + diagnosis, and retry.
+- **r** — record the rule for next time, don't retry.
+- **n** — do nothing.
+
+It never rewrites its own code — only the markdown rules you can read and edit.
+The clean-context retry runs once; if it sticks again, mimi reports and stops
+rather than looping.
+
+---
+
 ## tools
 
 mimi has ten tools. That is the entire surface area.
