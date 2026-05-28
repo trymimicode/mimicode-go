@@ -10,11 +10,13 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/trymimicode/mimicode-go/internal/agent"
+	"github.com/trymimicode/mimicode-go/internal/checkpoint"
 	"github.com/trymimicode/mimicode-go/internal/compactor"
 	"github.com/trymimicode/mimicode-go/internal/provider"
 	reflectpkg "github.com/trymimicode/mimicode-go/internal/reflect"
@@ -125,6 +127,9 @@ func runOneShot(ctx context.Context, sessionID, cwd, prompt string, out, errOut 
 		return 1
 	}
 
+	cp := checkpoint.New(sess.Path(), cwd)
+	cp.Snapshot("session start")
+
 	printTurnStart(errOut, sess)
 	cfg := agent.AgentConfig{CWD: cwd, Session: sess, MaxSteps: 25}
 	var err error
@@ -138,6 +143,7 @@ func runOneShot(ctx context.Context, sessionID, cwd, prompt string, out, errOut 
 		return 1
 	}
 	messages = maybeCompactAndSave(ctx, sess, messages, errOut)
+	snapshotTurn(cp, 1, prompt, errOut)
 
 	if text := extractLastAssistantText(messages); text != "" {
 		fmt.Fprintln(out, text)
@@ -152,8 +158,11 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 		return 1
 	}
 	cfg := agent.AgentConfig{CWD: cwd, Session: sess, MaxSteps: 25}
-	fmt.Fprintln(errOut, "[mimicode] REPL. empty line or :q / ctrl-d to exit. :compact for compaction.")
+	cp := checkpoint.New(sess.Path(), cwd)
+	cp.Snapshot("session start")
+	fmt.Fprintln(errOut, "[mimicode] REPL. empty line or :q / ctrl-d to exit. :compact compaction, :undo [n] revert turns.")
 
+	turn := 0
 	reader := bufio.NewReader(in)
 	for {
 		line, err := reader.ReadString('\n')
@@ -175,6 +184,13 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 			}
 			continue
 		}
+		if strings.HasPrefix(prompt, ":undo") {
+			handleUndoCommand(cp, strings.TrimSpace(strings.TrimPrefix(prompt, ":undo")), errOut)
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
 
 		printTurnStart(errOut, sess)
 		var turnErr error
@@ -191,6 +207,8 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 			return 1
 		}
 		messages = maybeCompactAndSave(ctx, sess, messages, errOut)
+		turn++
+		snapshotTurn(cp, turn, prompt, errOut)
 		if text := extractLastAssistantText(messages); text != "" {
 			fmt.Fprintln(out, text)
 			fmt.Fprintln(out)
@@ -271,6 +289,57 @@ func handleCompactCommand(ctx context.Context, sess *store.Session, messages []p
 
 func printTurnStart(errOut io.Writer, sess *store.Session) {
 	fmt.Fprintf(errOut, "session: %s  model: %s\n", sess.ID, sess.Model)
+}
+
+func snapshotTurn(cp *checkpoint.Checkpointer, turn int, prompt string, errOut io.Writer) {
+	label := fmt.Sprintf("turn %d: %s", turn, firstLine(prompt, 60))
+	sha, err := cp.Snapshot(label)
+	if err != nil {
+		fmt.Fprintf(errOut, "checkpoint: %v\n", err)
+		return
+	}
+	if sha != "" {
+		fmt.Fprintf(errOut, "checkpoint %s — %s\n", sha, label)
+	}
+}
+
+func handleUndoCommand(cp *checkpoint.Checkpointer, arg string, errOut io.Writer) {
+	if arg == "list" {
+		entries := cp.List()
+		if len(entries) == 0 {
+			fmt.Fprintln(errOut, "no checkpoints")
+			return
+		}
+		for _, e := range entries {
+			fmt.Fprintf(errOut, "  %s  %s\n", e.SHA, e.Label)
+		}
+		return
+	}
+	n := 1
+	if arg != "" {
+		parsed, err := strconv.Atoi(arg)
+		if err != nil || parsed < 1 {
+			fmt.Fprintln(errOut, "usage: :undo [n|list]")
+			return
+		}
+		n = parsed
+	}
+	label, err := cp.Undo(n)
+	if err != nil {
+		fmt.Fprintf(errOut, "undo: %v\n", err)
+		return
+	}
+	fmt.Fprintf(errOut, "reverted to: %s\n", label)
+}
+
+func firstLine(s string, max int) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > max {
+		s = s[:max] + "…"
+	}
+	return s
 }
 
 func printAgentErr(errOut io.Writer, err error) {
