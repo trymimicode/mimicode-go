@@ -19,16 +19,17 @@ var apiBase = "https://api.anthropic.com/v1/messages"
 const maxTokens = 8192
 
 const (
+	ModelOpus   = "claude-opus-4-20250514"
 	ModelSonnet = "claude-sonnet-4-5-20250929"
 	ModelHaiku  = "claude-haiku-4-5-20251001"
 )
 
-// DefaultModel returns the model from MIMICODE_MODEL env var or ModelSonnet.
+// DefaultModel returns the model from MIMICODE_MODEL env var or ModelOpus.
 func DefaultModel() string {
 	if m := strings.TrimSpace(os.Getenv("MIMICODE_MODEL")); m != "" {
 		return m
 	}
-	return ModelSonnet
+	return ModelOpus
 }
 
 // ── Stream event constants ────────────────────────────────────────────────────

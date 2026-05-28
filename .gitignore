@@ -1,1 +1,2 @@
-".env\n*.db\nsessions/\n.mimi/\nmimicode" 
+.env/
+.
