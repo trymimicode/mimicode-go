@@ -79,6 +79,29 @@ with `MIMICODE_CHECKPOINT=0`.
 
 ---
 
+## confirm-gate
+
+Run with `--confirm` (or `MIMICODE_CONFIRM=1`) and mimi asks before every
+side-effecting tool — `bash`, `write`, `edit`. Read-only tools (read, search,
+web, memory) never prompt.
+
+```sh
+mimicode --confirm "refactor calc.go"
+```
+```
+  mimi wants to run edit:
+    calc.go
+    - func Add(a, b int) int { return a + b }
+    + func Add(a, b int) int { return a + b }
+  allow? [y]es / [n]o:
+```
+
+Deny and mimi gets the refusal as a tool result — it won't retry the same call,
+it picks a different approach or asks you what you want. Nothing touches your
+files or shell without a `y`.
+
+---
+
 ## self-recovery
 
 When mimi gets stuck — repeating the same failing tool call, a run of errors,
@@ -158,6 +181,7 @@ The loop adapts to your codebase and your workflow over time.
 |---|---|---|
 | `ANTHROPIC_API_KEY` | required | Anthropic API key |
 | `MIMICODE_MODEL` | Sonnet | model id to use for every turn |
+| `MIMICODE_CONFIRM` | `0` | set `1` to ask before each bash/write/edit (same as `--confirm`) |
 | `MIMICODE_CHECKPOINT` | `1` | set `0` to disable turn checkpoints / `:undo` |
 | `MIMICODE_MAX_STEPS` | `25` | max tool calls per turn |
 | `MIMICODE_COMPACT_AUTO` | `true` | auto-compact long sessions |

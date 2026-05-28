@@ -76,9 +76,11 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 	var sessionID string
 	var showVersion bool
 	var useTUI bool
+	var confirm bool
 	fs.StringVar(&sessionID, "s", "", "named session id")
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 	fs.BoolVar(&useTUI, "tui", false, "start terminal UI")
+	fs.BoolVar(&confirm, "confirm", false, "ask before each bash/write/edit")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -104,11 +106,12 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 		return 1
 	}
 
+	confirm = confirm || getenv("MIMICODE_CONFIRM") == "1"
 	prompt := strings.Join(fs.Args(), " ")
 	if prompt != "" {
-		return runOneShot(ctx, sessionID, cwd, prompt, out, errOut)
+		return runOneShot(ctx, sessionID, cwd, prompt, in, out, errOut, confirm)
 	}
-	return runREPL(ctx, sessionID, cwd, in, out, errOut)
+	return runREPL(ctx, sessionID, cwd, in, out, errOut, confirm)
 }
 
 func startupChecks(errOut io.Writer) error {
@@ -123,7 +126,7 @@ func startupChecks(errOut io.Writer) error {
 	return nil
 }
 
-func runOneShot(ctx context.Context, sessionID, cwd, prompt string, out, errOut io.Writer) int {
+func runOneShot(ctx context.Context, sessionID, cwd, prompt string, in io.Reader, out, errOut io.Writer, confirm bool) int {
 	sess, messages, ok := startSession(sessionID, cwd, errOut)
 	if !ok {
 		return 1
@@ -134,6 +137,9 @@ func runOneShot(ctx context.Context, sessionID, cwd, prompt string, out, errOut 
 
 	printTurnStart(errOut, sess)
 	cfg := agent.AgentConfig{CWD: cwd, Session: sess, MaxSteps: 25}
+	if confirm {
+		cfg.ConfirmTool = makeConfirmTool(bufio.NewReader(in), errOut)
+	}
 	var err error
 	messages, err = agentTurn(ctx, cfg, prompt, messages)
 	if stuck, ok := agent.IsStuck(err); ok {
@@ -164,7 +170,7 @@ func runOneShot(ctx context.Context, sessionID, cwd, prompt string, out, errOut 
 	return 0
 }
 
-func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errOut io.Writer) int {
+func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errOut io.Writer, confirm bool) int {
 	sess, messages, ok := startSession(sessionID, cwd, errOut)
 	if !ok {
 		return 1
@@ -176,6 +182,9 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 
 	turn := 0
 	reader := bufio.NewReader(in)
+	if confirm {
+		cfg.ConfirmTool = makeConfirmTool(reader, errOut)
+	}
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil && err != io.EOF {
@@ -406,6 +415,42 @@ func proposeRecovery(ctx context.Context, reader *bufio.Reader, sess *store.Sess
 		fmt.Fprintln(errOut, "  recovery skipped")
 		return "", false
 	}
+}
+
+// makeConfirmTool returns a gate that shows a pending bash/write/edit call and
+// reads y/n from the shared input reader.
+func makeConfirmTool(reader *bufio.Reader, w io.Writer) func(string, map[string]any) bool {
+	return func(name string, input map[string]any) bool {
+		fmt.Fprintf(w, "\n  mimi wants to run %s:\n%s", name, renderToolForConfirm(name, input))
+		fmt.Fprint(w, "  allow? [y]es / [n]o: ")
+		line, _ := reader.ReadString('\n')
+		ans := strings.ToLower(strings.TrimSpace(line))
+		return ans == "y" || ans == "yes"
+	}
+}
+
+func renderToolForConfirm(name string, input map[string]any) string {
+	switch name {
+	case "bash":
+		return "    $ " + asString(input["cmd"]) + "\n"
+	case "write":
+		content := asString(input["content"])
+		return fmt.Sprintf("    %s (%d lines)\n", asString(input["path"]), strings.Count(content, "\n")+1)
+	case "edit":
+		path := asString(input["path"])
+		if edits, ok := input["edits"].([]any); ok && len(edits) > 0 {
+			return fmt.Sprintf("    %s (%d edits)\n", path, len(edits))
+		}
+		return fmt.Sprintf("    %s\n    - %s\n    + %s\n", path,
+			firstLine(asString(input["old_text"]), 60), firstLine(asString(input["new_text"]), 60))
+	default:
+		return fmt.Sprintf("    %v\n", input)
+	}
+}
+
+func asString(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 func buildRecoveryPrompt(originalPrompt string, diag recovery.Diagnosis) string {
