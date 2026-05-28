@@ -41,9 +41,8 @@ func TestAgentTurnToolLoopThenFinalResponse(t *testing.T) {
 
 	t.Setenv("MIMICODE_COMPACT_AUTO", "0")
 	messages, err := AgentTurn(context.Background(), AgentConfig{
-		CWD:       t.TempDir(),
-		MaxSteps:  5,
-		SessionID: "agent-test",
+		CWD:      t.TempDir(),
+		MaxSteps: 5,
 	}, "please run echo", nil)
 	if err != nil {
 		t.Fatalf("AgentTurn: %v", err)

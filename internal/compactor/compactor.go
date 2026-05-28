@@ -366,10 +366,10 @@ func appendCompactionIndex(sessionPath string, record CompactionRecord) error {
 	return os.WriteFile(path, append(data, '\n'), 0o644)
 }
 
-func compactionsPath(sessionPath string) string {
-	return sessionPath + ".compactions.jsonl"
+func compactionsPath(sessionDir string) string {
+	return filepath.Join(sessionDir, "compactions.jsonl")
 }
 
-func indexPath(sessionPath string) string {
-	return sessionPath + ".compactions.index.json"
+func indexPath(sessionDir string) string {
+	return filepath.Join(sessionDir, "compactions.index.json")
 }

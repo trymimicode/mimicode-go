@@ -11,9 +11,43 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 const maxRepoMapChars = 4000
+
+var cache struct {
+	sync.RWMutex
+	content string
+	cwd     string
+}
+
+// Init builds the repomap synchronously and primes the cache.
+// Call once at session start before the first turn.
+func Init(cwd string) {
+	content := BuildRepoMap(cwd)
+	cache.Lock()
+	cache.content, cache.cwd = content, cwd
+	cache.Unlock()
+}
+
+// Cached returns the last built repomap without blocking.
+func Cached() string {
+	cache.RLock()
+	defer cache.RUnlock()
+	return cache.content
+}
+
+// RefreshAsync rebuilds the repomap in the background.
+// Call after each agent turn so the next turn has a fresh map.
+func RefreshAsync(cwd string) {
+	go func() {
+		content := BuildRepoMap(cwd)
+		cache.Lock()
+		cache.content, cache.cwd = content, cwd
+		cache.Unlock()
+	}()
+}
 
 var (
 	pySymbolRE = regexp.MustCompile(`^(def|class)\s+([A-Za-z_][A-Za-z0-9_]*)`)

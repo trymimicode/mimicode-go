@@ -9,17 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/trymimicode/mimicode-go/internal/logger"
 	"github.com/trymimicode/mimicode-go/internal/provider"
-	"github.com/trymimicode/mimicode-go/internal/router"
-	"github.com/trymimicode/mimicode-go/internal/session"
+	"github.com/trymimicode/mimicode-go/internal/store"
 )
 
-func RunReflect(ctx context.Context, sessionID string, cwd string) error {
-	messages, err := session.LoadMessages(session.Session{
-		ID:   sessionID,
-		Path: filepath.Join(logger.LOG_DIR, sessionID+".jsonl"),
-	})
+func RunReflect(ctx context.Context, sess *store.Session, cwd string) error {
+	messages, err := sess.LoadMessages()
 	if err != nil {
 		warn("load messages: %v", err)
 		return nil
@@ -35,7 +30,7 @@ func RunReflect(ctx context.Context, sessionID string, cwd string) error {
 			Type: "text",
 			Text: prompt,
 		}},
-	}}, "", nil, router.HAIKU)
+	}}, "", nil, provider.ModelHaiku)
 	if err != nil {
 		warn("reflect call: %v", err)
 		return nil
@@ -45,7 +40,7 @@ func RunReflect(ctx context.Context, sessionID string, cwd string) error {
 	if text == "" {
 		return nil
 	}
-	if err := appendMemory(cwd, sessionID, text); err != nil {
+	if err := appendMemory(cwd, sess.ID, text); err != nil {
 		warn("append memory: %v", err)
 	}
 	return nil
@@ -110,14 +105,12 @@ func appendMemory(cwd, sessionID, text string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-
 	path := filepath.Join(dir, "MEMORY.md")
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
 	_, err = fmt.Fprintf(f, "## session-reflect: %s — %s\n%s\n\n", sessionID, time.Now().UTC().Format(time.RFC3339), text)
 	return err
 }

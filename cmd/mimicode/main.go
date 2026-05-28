@@ -18,8 +18,8 @@ import (
 	"github.com/trymimicode/mimicode-go/internal/compactor"
 	"github.com/trymimicode/mimicode-go/internal/provider"
 	reflectpkg "github.com/trymimicode/mimicode-go/internal/reflect"
-	"github.com/trymimicode/mimicode-go/internal/router"
-	"github.com/trymimicode/mimicode-go/internal/session"
+	"github.com/trymimicode/mimicode-go/internal/repomap"
+	"github.com/trymimicode/mimicode-go/internal/store"
 )
 
 const version = "dev"
@@ -28,18 +28,16 @@ var (
 	lookPath     = exec.LookPath
 	getenv       = os.Getenv
 	getwd        = os.Getwd
-	resumeOrNew  = session.ResumeOrNew
-	loadMessages = session.LoadMessages
-	saveMessages = session.SaveMessages
 	agentTurn    = agent.AgentTurn
 	maybeCompact = compactor.MaybeCompact
 	compactNow   = compactor.Compact
 	statusText   = compactor.StatusText
-	runReflect   = reflectpkg.RunReflect
-	lastUsage    = provider.LastUsage
-	routeTurn    = router.RouteTurn
-	setenv       = os.Setenv
-	runTUIApp    = runTUI
+	runReflect   = func(ctx context.Context, sess *store.Session, cwd string) error {
+		return reflectpkg.RunReflect(ctx, sess, cwd)
+	}
+	lastUsage = provider.LastUsage
+	setenv    = os.Setenv
+	runTUIApp = runTUI
 )
 
 func main() {
@@ -122,20 +120,20 @@ func startupChecks(errOut io.Writer) error {
 }
 
 func runOneShot(ctx context.Context, sessionID, cwd, prompt string, out, errOut io.Writer) int {
-	sess, messages, ok := startSession(sessionID, errOut)
+	sess, messages, ok := startSession(sessionID, cwd, errOut)
 	if !ok {
 		return 1
 	}
 
-	printTurnStart(errOut, sess, prompt)
-	cfg := agent.AgentConfig{CWD: cwd, SessionID: sess.ID, MaxSteps: 25}
+	printTurnStart(errOut, sess)
+	cfg := agent.AgentConfig{CWD: cwd, Session: sess, MaxSteps: 25}
 	var err error
 	messages, err = agentTurn(ctx, cfg, prompt, messages)
 	if err != nil {
 		printAgentErr(errOut, err)
 		return 1
 	}
-	if err := saveMessages(sess, messages); err != nil {
+	if err := sess.SaveMessages(messages); err != nil {
 		fmt.Fprintf(errOut, "mimicode: save messages: %v\n", err)
 		return 1
 	}
@@ -144,16 +142,16 @@ func runOneShot(ctx context.Context, sessionID, cwd, prompt string, out, errOut 
 	if text := extractLastAssistantText(messages); text != "" {
 		fmt.Fprintln(out, text)
 	}
-	reflectSession(ctx, sess.ID, cwd)
+	reflectSession(ctx, sess, cwd)
 	return 0
 }
 
 func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errOut io.Writer) int {
-	sess, messages, ok := startSession(sessionID, errOut)
+	sess, messages, ok := startSession(sessionID, cwd, errOut)
 	if !ok {
 		return 1
 	}
-	cfg := agent.AgentConfig{CWD: cwd, SessionID: sess.ID, MaxSteps: 25}
+	cfg := agent.AgentConfig{CWD: cwd, Session: sess, MaxSteps: 25}
 	fmt.Fprintln(errOut, "[mimicode] REPL. empty line or :q / ctrl-d to exit. :compact for compaction.")
 
 	reader := bufio.NewReader(in)
@@ -178,7 +176,7 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 			continue
 		}
 
-		printTurnStart(errOut, sess, prompt)
+		printTurnStart(errOut, sess)
 		var turnErr error
 		messages, turnErr = agentTurn(ctx, cfg, prompt, messages)
 		if turnErr != nil {
@@ -188,7 +186,7 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 			}
 			return 1
 		}
-		if saveErr := saveMessages(sess, messages); saveErr != nil {
+		if saveErr := sess.SaveMessages(messages); saveErr != nil {
 			fmt.Fprintf(errOut, "mimicode: save messages: %v\n", saveErr)
 			return 1
 		}
@@ -202,31 +200,26 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 		}
 	}
 
-	reflectSession(ctx, sess.ID, cwd)
+	reflectSession(ctx, sess, cwd)
 	return 0
 }
 
-func startSession(sessionID string, errOut io.Writer) (session.Session, []provider.Message, bool) {
-	sess := resumeOrNew(sessionID)
-	if sess.Path == "" {
-		fmt.Fprintln(errOut, "mimicode: failed to start session")
-		return session.Session{}, nil, false
-	}
-	fmt.Fprintf(errOut, "session: %s\n", sess.Path)
-
-	messages, err := loadMessages(sess)
+func startSession(sessionID, cwd string, errOut io.Writer) (*store.Session, []provider.Message, bool) {
+	sess, messages, err := store.ResumeOrNew(sessionID, cwd, provider.DefaultModel())
 	if err != nil {
-		fmt.Fprintf(errOut, "mimicode: load messages: %v\n", err)
-		return session.Session{}, nil, false
+		fmt.Fprintf(errOut, "mimicode: start session: %v\n", err)
+		return nil, nil, false
 	}
+	fmt.Fprintf(errOut, "session: %s\n", sess.ID)
 	if len(messages) > 0 {
 		fmt.Fprintf(errOut, "resumed %d prior messages\n", len(messages))
 	}
+	repomap.Init(cwd)
 	return sess, messages, true
 }
 
-func maybeCompactAndSave(ctx context.Context, sess session.Session, messages []provider.Message, errOut io.Writer) []provider.Message {
-	next, record, err := maybeCompact(ctx, messages, sess.Path, lastUsage().InputTokens)
+func maybeCompactAndSave(ctx context.Context, sess *store.Session, messages []provider.Message, errOut io.Writer) []provider.Message {
+	next, record, err := maybeCompact(ctx, messages, sess.Path(), lastUsage().InputTokens)
 	if err != nil {
 		fmt.Fprintf(errOut, "mimicode: compact: %v\n", err)
 		return messages
@@ -234,7 +227,7 @@ func maybeCompactAndSave(ctx context.Context, sess session.Session, messages []p
 	if record == nil {
 		return messages
 	}
-	if err := saveMessages(sess, next); err != nil {
+	if err := sess.SaveMessages(next); err != nil {
 		fmt.Fprintf(errOut, "mimicode: save compacted messages: %v\n", err)
 		return messages
 	}
@@ -242,21 +235,21 @@ func maybeCompactAndSave(ctx context.Context, sess session.Session, messages []p
 	return next
 }
 
-func handleCompactCommand(ctx context.Context, sess session.Session, messages []provider.Message, arg string, errOut io.Writer) []provider.Message {
+func handleCompactCommand(ctx context.Context, sess *store.Session, messages []provider.Message, arg string, errOut io.Writer) []provider.Message {
 	switch arg {
 	case "on":
 		_ = setenv("MIMICODE_COMPACT_AUTO", "1")
-		fmt.Fprintln(errOut, statusText(sess.Path, lastUsage().InputTokens))
+		fmt.Fprintln(errOut, statusText(sess.Path(), lastUsage().InputTokens))
 		return messages
 	case "off":
 		_ = setenv("MIMICODE_COMPACT_AUTO", "0")
-		fmt.Fprintln(errOut, statusText(sess.Path, lastUsage().InputTokens))
+		fmt.Fprintln(errOut, statusText(sess.Path(), lastUsage().InputTokens))
 		return messages
 	case "status":
-		fmt.Fprintln(errOut, statusText(sess.Path, lastUsage().InputTokens))
+		fmt.Fprintln(errOut, statusText(sess.Path(), lastUsage().InputTokens))
 		return messages
 	case "":
-		next, record, err := compactNow(ctx, messages, sess.Path, 3, "manual")
+		next, record, err := compactNow(ctx, messages, sess.Path(), 3, "manual")
 		if err != nil {
 			fmt.Fprintf(errOut, "mimicode: compact: %v\n", err)
 			return messages
@@ -265,7 +258,7 @@ func handleCompactCommand(ctx context.Context, sess session.Session, messages []
 			fmt.Fprintln(errOut, "mimicode: nothing to compact")
 			return messages
 		}
-		if err := saveMessages(sess, next); err != nil {
+		if err := sess.SaveMessages(next); err != nil {
 			fmt.Fprintf(errOut, "mimicode: save compacted messages: %v\n", err)
 			return messages
 		}
@@ -277,10 +270,8 @@ func handleCompactCommand(ctx context.Context, sess session.Session, messages []
 	}
 }
 
-func printTurnStart(errOut io.Writer, sess session.Session, prompt string) {
-	choice := routeTurn(prompt)
-	fmt.Fprintf(errOut, "session: %s\n", sess.Path)
-	fmt.Fprintf(errOut, "model route: %s (%s)\n", choice.Model, choice.Reason)
+func printTurnStart(errOut io.Writer, sess *store.Session) {
+	fmt.Fprintf(errOut, "session: %s  model: %s\n", sess.ID, sess.Model)
 }
 
 func printAgentErr(errOut io.Writer, err error) {
@@ -291,10 +282,10 @@ func printAgentErr(errOut io.Writer, err error) {
 	fmt.Fprintf(errOut, "mimicode: agent: %v\n", err)
 }
 
-func reflectSession(ctx context.Context, sessionID, cwd string) {
+func reflectSession(ctx context.Context, sess *store.Session, cwd string) {
 	reflectCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	_ = runReflect(reflectCtx, sessionID, cwd)
+	_ = runReflect(reflectCtx, sess, cwd)
 }
 
 func extractLastAssistantText(messages []provider.Message) string {
