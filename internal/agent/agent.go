@@ -22,7 +22,7 @@ import (
 
 const SYSTEM_PROMPT = `You are a coding agent in a minimal harness called mimicode.
 
-You have four tools: read, bash, edit, write. Use them deliberately.
+You have seven tools: read, bash, edit, write, web_search, web_fetch, stackoverflow_search. Use them deliberately.
 
 SEARCH RULES (non-negotiable):
 - Use 'rg' (ripgrep) for every search. rg respects .gitignore by default.
@@ -51,6 +51,12 @@ MEMORY RULES:
 - Do not write speculative or vague summaries.
 - When the user asks about something that may have been worked on before ("how did we previously...",
   "have we built...", "where did we decide..."), call 'memory_search' before reading source files.
+
+WEB RULES:
+- Use web_search to find docs, examples, or answers. Add site: filters to scope (site:stackoverflow.com, site:pkg.go.dev, site:github.com).
+- Use web_fetch to get full content from a URL. Automatically handles GitHub issues, Reddit, HN, and Stack Overflow question URLs.
+- Use stackoverflow_search when debugging errors or looking for usage examples — it returns questions AND their top answers inline.
+- Always prefer stackoverflow_search over web_search for programming questions; it saves a round-trip.
 
 DEBUGGING RULES:
 - Before editing any file in response to an error, determine whether the error is in the code or
@@ -187,6 +193,41 @@ var TOOLS = []provider.ToolSchema{
 			},
 		},
 	},
+	{
+		Name:        "web_search",
+		Description: "Search the web via DuckDuckGo. Returns title+url+snippet per result. Add site: filters in the query to scope results (e.g. site:stackoverflow.com).",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query":       map[string]any{"type": "string", "description": "Search query."},
+				"max_results": map[string]any{"type": "integer", "description": "Max results to return (default 8)."},
+			},
+			"required": []any{"query"},
+		},
+	},
+	{
+		Name:        "web_fetch",
+		Description: "Fetch a URL and return its main text. Handles GitHub issues, Reddit posts, HN threads, and Stack Overflow questions with dedicated extractors; falls back to generic HTML for everything else.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"url": map[string]any{"type": "string", "description": "URL to fetch."},
+			},
+			"required": []any{"url"},
+		},
+	},
+	{
+		Name:        "stackoverflow_search",
+		Description: "Search Stack Overflow and return matching questions with their top answers inline. Use for debugging errors and finding usage examples.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query":       map[string]any{"type": "string", "description": "Search query."},
+				"max_results": map[string]any{"type": "integer", "description": "Max questions to return (default 3)."},
+			},
+			"required": []any{"query"},
+		},
+	},
 }
 
 func BuildSystem(cwd string) string {
@@ -310,6 +351,15 @@ func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[s
 		}
 	case "recall_compaction":
 		output, isErr = recallCompaction(currentSessionPath(cfg), stringInput(input, "id"))
+	case "web_search":
+		result := tools.WebSearch(ctx, stringInput(input, "query"), intInput(input, "max_results"))
+		output, isErr = result.Output, result.IsError
+	case "web_fetch":
+		result := tools.WebFetch(ctx, stringInput(input, "url"))
+		output, isErr = result.Output, result.IsError
+	case "stackoverflow_search":
+		result := tools.StackOverflowSearch(ctx, stringInput(input, "query"), intInput(input, "max_results"))
+		output, isErr = result.Output, result.IsError
 	default:
 		output, isErr = fmt.Sprintf("unknown tool: %s", name), true
 	}
