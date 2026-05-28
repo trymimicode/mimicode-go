@@ -76,7 +76,13 @@ type AgentConfig struct {
 	MaxSteps int
 	Session  *store.Session // nil = no logging
 	StreamCB provider.StreamCallback
+	// ConfirmTool, if set, is called before each mutating tool (bash/write/edit).
+	// Returning false blocks the call. nil = no gating.
+	ConfirmTool func(name string, input map[string]any) bool
 }
+
+// gatedTools are the side-effecting tools the confirm-gate guards.
+var gatedTools = map[string]bool{"bash": true, "write": true, "edit": true}
 
 type AgentInterrupted struct{}
 
@@ -329,6 +335,21 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 			if err := ctx.Err(); err != nil {
 				return messages, AgentInterrupted{}
 			}
+
+			if cfg.ConfirmTool != nil && gatedTools[tu.Name] && !cfg.ConfirmTool(tu.Name, tu.Input) {
+				if cfg.Session != nil {
+					cfg.Session.LogToolExec(turn, step+1, store.ToolExecEvent{ID: tu.ID, Name: tu.Name, Input: tu.Input})
+					cfg.Session.LogToolDone(turn, step+1, store.ToolDoneEvent{ID: tu.ID, Name: tu.Name, Error: true, Preview: "blocked by user"})
+				}
+				results = append(results, provider.ContentBlock{
+					Type:      "tool_result",
+					Content:   "Blocked: the user did not approve this " + tu.Name + " call. Do not retry it — choose a different approach or ask the user what they want.",
+					IsError:   true,
+					ToolUseID: tu.ID,
+				})
+				continue
+			}
+
 			if cfg.Session != nil {
 				cfg.Session.LogToolExec(turn, step+1, store.ToolExecEvent{ID: tu.ID, Name: tu.Name, Input: tu.Input})
 			}
