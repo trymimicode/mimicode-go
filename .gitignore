@@ -1,1 +1,6 @@
-".env\n*.db\nsessions/\n.mimi/\nmimicode" 
+.env
+*.db
+sessions/
+.mimi/
+/mimicode
+/mimicode.exe
