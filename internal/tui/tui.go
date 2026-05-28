@@ -14,8 +14,7 @@ import (
 	"github.com/trymimicode/mimicode-go/internal/agent"
 	"github.com/trymimicode/mimicode-go/internal/compactor"
 	"github.com/trymimicode/mimicode-go/internal/provider"
-	"github.com/trymimicode/mimicode-go/internal/router"
-	"github.com/trymimicode/mimicode-go/internal/session"
+	"github.com/trymimicode/mimicode-go/internal/store"
 )
 
 type streamMsg struct {
@@ -37,7 +36,7 @@ type line struct {
 }
 
 type model struct {
-	session  session.Session
+	session  *store.Session
 	cwd      string
 	messages []provider.Message
 	lines    []line
@@ -69,18 +68,13 @@ var (
 )
 
 func RunTUI(sessionID string) error {
-	sess := session.ResumeOrNew(sessionID)
-	if sess.Path == "" {
-		return fmt.Errorf("start session")
-	}
-
-	messages, err := session.LoadMessages(sess)
-	if err != nil {
-		return err
-	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
+	}
+	sess, messages, err := store.ResumeOrNew(sessionID, cwd, provider.DefaultModel())
+	if err != nil {
+		return fmt.Errorf("start session: %w", err)
 	}
 
 	m := &model{
@@ -119,11 +113,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			m.lines = append(m.lines, line{Kind: "error", Text: "error: " + msg.Err.Error()})
 		}
-		_ = session.SaveMessages(m.session, m.messages)
-		next, record, err := compactor.MaybeCompact(context.Background(), m.messages, m.session.Path, msg.Usage.InputTokens)
+		_ = m.session.SaveMessages(m.messages)
+		next, record, err := compactor.MaybeCompact(context.Background(), m.messages, m.session.Path(), msg.Usage.InputTokens)
 		if err == nil && record != nil {
 			m.messages = next
-			_ = session.SaveMessages(m.session, m.messages)
+			_ = m.session.SaveMessages(m.messages)
 			m.lines = renderMessages(m.messages)
 		}
 		m.scrollToBottom()
@@ -199,7 +193,7 @@ func (m *model) View() string {
 		b.WriteString("\n")
 	}
 
-	status := fmt.Sprintf(" session=%s model=%s cost=$%.4f", m.session.ID, currentModel(m.modelName), m.currentCost)
+	status := fmt.Sprintf(" session=%s model=%s cost=$%.4f", m.session.ID, shortModel(m.modelName), m.currentCost)
 	if m.running {
 		status += fmt.Sprintf(" step=%d %s %s", m.step, spinner(m.spinner), m.lastTool)
 	}
@@ -221,7 +215,7 @@ func (m *model) submit() {
 	m.input = ""
 	m.running = true
 	m.step++
-	m.modelName = router.RouteTurn(prompt).Model
+	m.modelName = provider.DefaultModel()
 	m.streamText = ""
 	m.lastTool = "thinking"
 	m.messages = append(m.messages, provider.Message{
@@ -244,10 +238,10 @@ func (m *model) submit() {
 	}
 	go func() {
 		next, err := agent.AgentTurn(ctx, agent.AgentConfig{
-			CWD:       m.cwd,
-			SessionID: m.session.ID,
-			MaxSteps:  25,
-			StreamCB:  cb,
+			CWD:      m.cwd,
+			Session:  m.session,
+			MaxSteps: 25,
+			StreamCB: cb,
 		}, prompt, before)
 		if m.program != nil {
 			m.program.Send(turnDoneMsg{Messages: next, Err: err, Usage: provider.LastUsage()})
@@ -427,11 +421,11 @@ func spinner(i int) string {
 	return frames[i%len(frames)]
 }
 
-func currentModel(model string) string {
+func shortModel(model string) string {
 	switch model {
-	case router.HAIKU:
+	case provider.ModelHaiku:
 		return "haiku"
-	case router.SONNET:
+	case provider.ModelSonnet:
 		return "sonnet"
 	case "":
 		return "-"

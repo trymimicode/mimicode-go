@@ -6,17 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/trymimicode/mimicode-go/internal/compactor"
-	"github.com/trymimicode/mimicode-go/internal/logger"
 	"github.com/trymimicode/mimicode-go/internal/memory"
 	"github.com/trymimicode/mimicode-go/internal/provider"
 	"github.com/trymimicode/mimicode-go/internal/repomap"
-	"github.com/trymimicode/mimicode-go/internal/router"
+	"github.com/trymimicode/mimicode-go/internal/store"
 	"github.com/trymimicode/mimicode-go/internal/tools"
 )
 
@@ -74,17 +72,15 @@ STYLE:
 - Remove redundant word usage like 'Now I will', 'Perfect! Now', etc.`
 
 type AgentConfig struct {
-	CWD       string
-	MaxSteps  int // default 25, overrideable via MIMICODE_MAX_STEPS env
-	SessionID string
-	StreamCB  provider.StreamCallback // nil = non-streaming
+	CWD      string
+	MaxSteps int
+	Session  *store.Session // nil = no logging
+	StreamCB provider.StreamCallback
 }
 
 type AgentInterrupted struct{}
 
-func (AgentInterrupted) Error() string {
-	return "agent interrupted"
-}
+func (AgentInterrupted) Error() string { return "agent interrupted" }
 
 var (
 	callClaude          = provider.CallClaude
@@ -236,7 +232,7 @@ func BuildSystem(cwd string) string {
 	fmt.Fprintf(&b, "\n\nCurrent date: %s", time.Now().Format("2006-01-02"))
 	fmt.Fprintf(&b, "\nCurrent working directory: %s", cwd)
 
-	if repo := repomap.BuildRepoMap(cwd); repo != "" {
+	if repo := repomap.Cached(); repo != "" {
 		fmt.Fprintf(&b, "\n\n## Repository map\n%s", repo)
 	}
 	if rules := memory.LoadRules(cwd); rules != "" {
@@ -250,27 +246,24 @@ func BuildSystem(cwd string) string {
 
 func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []provider.Message) ([]provider.Message, error) {
 	cfg = normalizeConfig(cfg)
-	ensureLogger(cfg.SessionID)
 
-	logEvent("user_message", map[string]any{"text": userMsg})
+	var turn int
+	if cfg.Session != nil {
+		turn = cfg.Session.LogUser(userMsg)
+	}
+
 	messages = append(messages, provider.Message{
 		Role: "user",
-		Content: []provider.ContentBlock{{
-			Type: "text",
-			Text: userMsg,
-		}},
+		Content: []provider.ContentBlock{{Type: "text", Text: userMsg}},
 	})
 
 	system := BuildSystem(cfg.CWD)
-	choice := router.RouteTurn(userMsg)
-	system = router.AugmentSystemPrompt(system, choice.Guidance)
-	logEvent("model_route", map[string]any{
-		"model":    choice.Model,
-		"reason":   choice.Reason,
-		"guidance": choice.Guidance,
-	})
+	model := provider.DefaultModel()
+	sessionDir := ""
+	if cfg.Session != nil {
+		sessionDir = cfg.Session.Path()
+	}
 
-	sessionPath := currentSessionPath(cfg)
 	for step := 0; step < cfg.MaxSteps; step++ {
 		if err := ctx.Err(); err != nil {
 			return messages, AgentInterrupted{}
@@ -278,23 +271,40 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 
 		var record *compactor.CompactionRecord
 		var err error
-		messages, record, err = compactor.MaybeCompact(ctx, messages, sessionPath, provider.LastUsage().InputTokens)
-		if err != nil {
-			return messages, err
-		}
-		if record != nil {
-			logEvent("compaction", map[string]any{"id": record.ID, "reason": record.Reason})
+		if sessionDir != "" {
+			messages, record, err = compactor.MaybeCompact(ctx, messages, sessionDir, provider.LastUsage().InputTokens)
+			if err != nil {
+				return messages, err
+			}
+			if record != nil && cfg.Session != nil {
+				cfg.Session.LogCompaction(record.ID, record.Reason)
+			}
 		}
 
-		msg, _, err := callModel(ctx, cfg, messages, system, choice.Model)
+		t0 := time.Now()
+		msg, usage, err := callModel(ctx, cfg, messages, system, model)
+		ms := time.Since(t0).Milliseconds()
 		if err != nil {
 			return messages, err
 		}
 		messages = append(messages, msg)
 
+		if cfg.Session != nil {
+			cfg.Session.LogModel(turn, step+1, store.ModelEvent{
+				Model:  model,
+				Text:   msgText(msg),
+				Calls:  msgCalls(msg),
+				Tokens: store.TokenRec{In: usage.InputTokens, Out: usage.OutputTokens, CR: usage.CacheRead, CW: usage.CacheWrite},
+				Ms:     ms,
+			})
+		}
+
 		toolUses := toolUseBlocks(msg)
 		if len(toolUses) == 0 {
-			logEvent("turn_end", map[string]any{"reason": "no_tool_use", "steps": step + 1})
+			if cfg.Session != nil {
+				cfg.Session.LogTurnEnd(turn, step+1, "no_tool_use")
+			}
+			repomap.RefreshAsync(cfg.CWD)
 			return messages, nil
 		}
 
@@ -303,21 +313,36 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 			if err := ctx.Err(); err != nil {
 				return messages, AgentInterrupted{}
 			}
-			logEvent("tool_call", map[string]any{"id": tu.ID, "name": tu.Name, "input": tu.Input})
+			if cfg.Session != nil {
+				cfg.Session.LogToolExec(turn, step+1, store.ToolExecEvent{ID: tu.ID, Name: tu.Name, Input: tu.Input})
+			}
+			t1 := time.Now()
 			result := dispatchTool(ctx, cfg, tu.Name, tu.Input)
+			toolMs := time.Since(t1).Milliseconds()
 			result.ToolUseID = tu.ID
-			logEvent("tool_result", map[string]any{
-				"id":       tu.ID,
-				"name":     tu.Name,
-				"is_error": result.IsError,
-				"content":  result.Content,
-			})
+			if cfg.Session != nil {
+				preview := result.Content
+				if len(preview) > 300 {
+					preview = preview[:300]
+				}
+				cfg.Session.LogToolDone(turn, step+1, store.ToolDoneEvent{
+					ID:      tu.ID,
+					Name:    tu.Name,
+					Ms:      toolMs,
+					Error:   result.IsError,
+					Bytes:   len(result.Content),
+					Preview: preview,
+				})
+			}
 			results = append(results, result)
 		}
 		messages = append(messages, provider.Message{Role: "user", Content: results})
 	}
 
-	logEvent("turn_end", map[string]any{"reason": "max_steps", "steps": cfg.MaxSteps})
+	if cfg.Session != nil {
+		cfg.Session.LogTurnEnd(turn, cfg.MaxSteps, "max_steps")
+	}
+	repomap.RefreshAsync(cfg.CWD)
 	return messages, nil
 }
 
@@ -339,7 +364,7 @@ func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[s
 		result := tools.Edit(ctx, cfg.CWD, stringInput(input, "path"), stringInputAny(input, "old_text", "oldText"), stringInputAny(input, "new_text", "newText"), editInputs(input))
 		output, isErr = result.Output, result.IsError
 	case "memory_write":
-		output = memory.HandleMemoryWrite(cfg.SessionID, input, cfg.CWD)
+		output = memory.HandleMemoryWrite("", input, cfg.CWD)
 		isErr = strings.Contains(strings.ToLower(output), "error")
 	case "memory_search":
 		query := stringInput(input, "query")
@@ -350,7 +375,11 @@ func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[s
 			output = memory.FormatResults(results, query)
 		}
 	case "recall_compaction":
-		output, isErr = recallCompaction(currentSessionPath(cfg), stringInput(input, "id"))
+		dir := ""
+		if cfg.Session != nil {
+			dir = cfg.Session.Path()
+		}
+		output, isErr = recallCompaction(dir, stringInput(input, "id"))
 	case "web_search":
 		result := tools.WebSearch(ctx, stringInput(input, "query"), intInput(input, "max_results"))
 		output, isErr = result.Output, result.IsError
@@ -400,27 +429,6 @@ func maxSteps(current int) int {
 	return 25
 }
 
-func ensureLogger(sessionID string) {
-	if logger.CurrentSession() != nil || sessionID == "" {
-		return
-	}
-	_, _ = logger.StartSession(sessionID)
-}
-
-func logEvent(kind string, data map[string]any) {
-	_ = logger.Log(kind, data)
-}
-
-func currentSessionPath(cfg AgentConfig) string {
-	if s := logger.CurrentSession(); s != nil {
-		return s.Path
-	}
-	if cfg.SessionID == "" {
-		return filepath.Join(cfg.CWD, ".mimi", "session.jsonl")
-	}
-	return filepath.Join(cfg.CWD, ".mimi", cfg.SessionID+".jsonl")
-}
-
 func toolUseBlocks(msg provider.Message) []provider.ContentBlock {
 	var out []provider.ContentBlock
 	for _, block := range msg.Content {
@@ -429,6 +437,26 @@ func toolUseBlocks(msg provider.Message) []provider.ContentBlock {
 		}
 	}
 	return out
+}
+
+func msgText(msg provider.Message) string {
+	var parts []string
+	for _, b := range msg.Content {
+		if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+			parts = append(parts, strings.TrimSpace(b.Text))
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func msgCalls(msg provider.Message) []store.CallRec {
+	var calls []store.CallRec
+	for _, b := range msg.Content {
+		if b.Type == "tool_use" {
+			calls = append(calls, store.CallRec{ID: b.ID, Name: b.Name, Input: b.Input})
+		}
+	}
+	return calls
 }
 
 func stringInput(input map[string]any, key string) string {
@@ -505,9 +533,12 @@ func editInputs(input map[string]any) []tools.EditOp {
 	return edits
 }
 
-func recallCompaction(sessionPath, id string) (string, bool) {
+func recallCompaction(sessionDir, id string) (string, bool) {
+	if sessionDir == "" {
+		return "no active session", true
+	}
 	if id != "" {
-		record := compactor.LoadCompaction(sessionPath, id)
+		record := compactor.LoadCompaction(sessionDir, id)
 		if record == nil {
 			return "compaction not found: " + id, true
 		}
@@ -517,8 +548,7 @@ func recallCompaction(sessionPath, id string) (string, bool) {
 		}
 		return string(data), false
 	}
-
-	records := compactor.ListCompactions(sessionPath)
+	records := compactor.ListCompactions(sessionDir)
 	if len(records) == 0 {
 		return "no compactions", false
 	}
