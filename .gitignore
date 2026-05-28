@@ -1,2 +1,6 @@
-.env/
-.
+.env
+*.db
+sessions/
+.mimi/
+/mimicode
+/mimicode.exe

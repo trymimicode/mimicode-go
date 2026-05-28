@@ -210,7 +210,6 @@ func startSession(sessionID, cwd string, errOut io.Writer) (*store.Session, []pr
 		fmt.Fprintf(errOut, "mimicode: start session: %v\n", err)
 		return nil, nil, false
 	}
-	fmt.Fprintf(errOut, "session: %s\n", sess.ID)
 	if len(messages) > 0 {
 		fmt.Fprintf(errOut, "resumed %d prior messages\n", len(messages))
 	}
