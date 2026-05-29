@@ -26,7 +26,11 @@ import (
 	"github.com/trymimicode/mimicode-go/internal/store"
 )
 
-const version = "dev"
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
+)
 
 var (
 	lookPath     = exec.LookPath
@@ -85,7 +89,10 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 		return 2
 	}
 	if showVersion {
-		fmt.Fprintln(out, version)
+		fmt.Fprintf(out, "mimicode version %s\n", version)
+		fmt.Fprintf(out, "  commit: %s\n", commit)
+		fmt.Fprintf(out, "  built:  %s\n", buildDate)
+		fmt.Fprintf(out, "  go:     %s\n", runtime.Version())
 		return 0
 	}
 
