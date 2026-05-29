@@ -157,7 +157,13 @@ func TestCLIFlagsVersion(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("runCLI exit code = %d, stderr:\n%s", code, stderr.String())
 	}
-	if strings.TrimSpace(stdout.String()) != version {
-		t.Fatalf("version output = %q, want %q", stdout.String(), version)
+	out := stdout.String()
+	if !strings.Contains(out, "mimicode version "+version) {
+		t.Fatalf("version output = %q, want it to contain %q", out, "mimicode version "+version)
+	}
+	for _, field := range []string{"commit:", "built:", "go:"} {
+		if !strings.Contains(out, field) {
+			t.Errorf("version output missing %q field:\n%s", field, out)
+		}
 	}
 }

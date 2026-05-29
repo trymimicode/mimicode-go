@@ -20,7 +20,7 @@ import (
 
 const SYSTEM_PROMPT = `You are a coding agent in a minimal harness called mimicode.
 
-You have seven tools: read, bash, edit, write, web_search, web_fetch, stackoverflow_search. Use them deliberately.
+You have these tools: read, bash, edit, write, web_search, web_fetch, stackoverflow_search, git_source. Use them deliberately.
 
 SEARCH RULES (non-negotiable):
 - Use 'rg' (ripgrep) for every search. rg respects .gitignore by default.
@@ -55,6 +55,9 @@ WEB RULES:
 - Use web_fetch to get full content from a URL. Automatically handles GitHub issues, Reddit, HN, and Stack Overflow question URLs.
 - Use stackoverflow_search when debugging errors or looking for usage examples — it returns questions AND their top answers inline.
 - Always prefer stackoverflow_search over web_search for programming questions; it saves a round-trip.
+- Use git_source to fetch the REAL source of a library/repo (shallow clone into .mimi/cache) when the engineer
+  needs to learn how something actually works. Prefer reading real source over describing it from memory: after
+  git_source, rg/read the returned local path and cite real file:line. Real code beats a confident guess.
 
 DEBUGGING RULES:
 - Before editing any file in response to an error, determine whether the error is in the code or
@@ -240,6 +243,18 @@ var TOOLS = []provider.ToolSchema{
 				"max_results": map[string]any{"type": "integer", "description": "Max questions to return (default 3)."},
 			},
 			"required": []any{"query"},
+		},
+	},
+	{
+		Name:        "git_source",
+		Description: "Shallow-clone a real repository into the project cache (.mimi/cache) and return its local path plus a file listing, so you can rg/read the actual source. Use to learn how a library really works instead of guessing.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"repo": map[string]any{"type": "string", "description": "Repo reference: \"owner/repo\" (GitHub), a host path, a full git URL, or scp form."},
+				"ref":  map[string]any{"type": "string", "description": "Optional branch or tag to clone."},
+			},
+			"required": []any{"repo"},
 		},
 	},
 }
@@ -467,6 +482,9 @@ func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[s
 		output, isErr = result.Output, result.IsError
 	case "stackoverflow_search":
 		result := tools.StackOverflowSearch(ctx, stringInput(input, "query"), intInput(input, "max_results"))
+		output, isErr = result.Output, result.IsError
+	case "git_source":
+		result := tools.GitSource(ctx, cfg.CWD, stringInput(input, "repo"), stringInput(input, "ref"))
 		output, isErr = result.Output, result.IsError
 	default:
 		output, isErr = fmt.Sprintf("unknown tool: %s", name), true
