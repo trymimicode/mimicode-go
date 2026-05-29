@@ -367,6 +367,12 @@ func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[s
 	case "read":
 		result := tools.Read(ctx, cfg.CWD, stringInput(input, "path"), intInput(input, "offset"), intInput(input, "limit"))
 		output, isErr = result.Output, result.IsError
+		if cfg.StreamCB != nil && !isErr && result.Output != "" {
+			cfg.StreamCB("file_read", map[string]any{
+				"path":   stringInput(input, "path"),
+				"output": result.Output,
+			})
+		}
 	case "write":
 		result := tools.Write(ctx, cfg.CWD, stringInput(input, "path"), stringInput(input, "content"))
 		output, isErr = result.Output, result.IsError

@@ -1,0 +1,330 @@
+MIMICODE GO ARCHITECTURE PSEUDOCODE
+=====================================
+
+OVERVIEW:
+Mimicode is an AI coding assistant that uses Claude (Anthropic) to help with programming tasks.
+It provides both REPL and TUI interfaces, manages conversation sessions, and includes various
+coding tools like file editing, bash execution, and web search.
+
+MAIN COMPONENTS:
+
+1. ENTRY POINT (cmd/mimicode/main.go)
+----------------------------------------
+function main():
+    setup signal handlers for graceful shutdown
+    parse command line arguments:
+        -s: session ID
+        -tui: start terminal UI
+        -version: show version
+    
+    if tui_flag:
+        run_tui_interface()
+    else if has_prompt:
+        run_oneshot_mode(prompt)
+    else:
+        run_repl_mode()
+
+function run_repl():
+    session = create_or_resume_session()
+    while true:
+        prompt = read_user_input()
+        if prompt == "exit":
+            break
+        
+        response = agent_turn(prompt)
+        display_response(response)
+        
+        maybe_compact_session()  # Auto-compress old messages
+        save_session()
+
+function run_oneshot():
+    session = create_session()
+    response = agent_turn(prompt)
+    display_response(response)
+    reflect_on_session()  # Generate memory entries
+
+2. AGENT CORE (internal/agent/agent.go)
+----------------------------------------
+SYSTEM_PROMPT = """
+You are a coding agent in mimicode...
+[Detailed rules for search, editing, memory, web, debugging, style]
+"""
+
+TOOLS = [
+    bash: execute shell commands
+    read: read file contents
+    write: create/overwrite files
+    edit: find-replace in files
+    web_search: search web via DuckDuckGo
+    web_fetch: fetch URL content
+    stackoverflow_search: search Stack Overflow
+    memory_write: save important info
+    memory_search: search past sessions
+    recall_compaction: load compressed history
+]
+
+function agent_turn(user_message, config):
+    messages = session.get_messages()
+    messages.append(user_message)
+    
+    # Add system context
+    if repo_map_exists():
+        messages[0].content.append(repo_map)
+    if memory_exists():
+        messages[0].content.append(memory_content)
+    
+    step_count = 0
+    while step_count < MAX_STEPS:
+        # Call Claude API
+        response = call_claude(messages, tools=TOOLS)
+        
+        # Process response
+        if response.has_tool_calls():
+            for tool_call in response.tool_calls:
+                result = execute_tool(tool_call)
+                messages.append(tool_result_message(result))
+            step_count++
+        else:
+            # Final response reached
+            break
+    
+    return response
+
+function execute_tool(tool_call):
+    switch tool_call.name:
+        case "bash":
+            return bash_execute(tool_call.input)
+        case "read":
+            return read_file(tool_call.input)
+        case "edit":
+            return edit_file(tool_call.input)
+        # ... other tools
+        
+3. TERMINAL UI (internal/tui/tui.go)
+----------------------------------------
+type Model:
+    messages: list of displayed lines
+    input: current user input
+    cursor: cursor position
+    running: is agent active
+    scroll: scroll position
+    history: command history
+    show_onboarding: first time user
+    
+function run_tui():
+    model = initialize_model()
+    
+    # Bubble Tea event loop
+    while true:
+        event = wait_for_event()
+        
+        switch event.type:
+            case key_press:
+                handle_keyboard(event.key)
+            case window_resize:
+                update_dimensions()
+            case stream_msg:
+                append_agent_output(event.data)
+            case turn_done:
+                mark_turn_complete()
+                
+function handle_keyboard(key):
+    # Handle Enter, arrows, Ctrl+C, etc.
+    # Alt+Enter for newline, Enter to submit
+            
+function render_view():
+    # Render header, messages, tool status, input area, ribbon
+    return formatted_tui_layout()
+
+4. TOOLS (internal/tools/)
+----------------------------------------
+function bash_execute(cmd, timeout):
+    # Vet dangerous commands
+    for rule in BLOCKED_PATTERNS:
+        if matches(cmd, rule):
+            return error(rule.hint)
+    
+    # Execute with timeout
+    process = start_process(cmd)
+    result = wait_with_timeout(process, timeout)
+    
+    # Strip ANSI codes and truncate
+    output = strip_ansi(result.output)
+    if len(output) > MAX_OUTPUT_SIZE:
+        output = tail_truncate(output)
+        
+    return ToolResult{output, is_error, truncated}
+
+function read_file(path, offset, limit):
+    if is_binary(path):
+        return error("binary file")
+        
+    content = read_file_lines(path)
+    
+    # Apply offset/limit
+    if offset > 0:
+        content = content[offset:]
+    if limit > 0:
+        content = content[:limit]
+        
+    return format_with_line_numbers(content)
+
+function edit_file(path, edits):
+    # Lock file for concurrent access
+    lock = get_file_lock(path)
+    lock.acquire()
+    defer lock.release()
+    
+    content = read_file(path)
+    
+    # Apply all edits atomically
+    for edit in edits:
+        matches = find_exact_matches(content, edit.old_text)
+        if len(matches) != 1:
+            return error("need exactly one match")
+        content = replace(content, edit.old_text, edit.new_text)
+    
+    write_file(path, content)
+    return generate_diff(old_content, content)
+
+5. PROVIDER (internal/provider/)
+----------------------------------------
+function call_claude(messages, tools, streaming):
+    request = {
+        model: get_model(),  # Default: claude-opus-4
+        messages: convert_to_api_format(messages),
+        tools: tools,
+        system: [{
+            type: "text",
+            text: SYSTEM_PROMPT,
+            cache_control: {type: "ephemeral"}  # Cache system prompt
+        }],
+        max_tokens: 8192
+    }
+    
+    if streaming:
+        return stream_response(request)
+    else:
+        response = http_post(ANTHROPIC_API, request)
+        return parse_response(response)
+
+function stream_response(request):
+    # Stream events from Claude API
+    # Yield text deltas and tool use events
+
+6. SESSION STORE (internal/store/)
+----------------------------------------
+type Session:
+    id: unique identifier
+    cwd: working directory
+    model: AI model used
+    messages: conversation history
+    events_file: append-only log
+    
+function create_session(id):
+    # Create session with metadata
+    # Setup directory structure in ~/.mimi/sessions/<id>/
+    # Open events.jsonl for append
+    return session
+
+function log_event(event_type, data):
+    # Write timestamped event to JSONL file
+
+7. MEMORY SYSTEM (internal/memory/)
+----------------------------------------
+function memory_search(query, kind):
+    db = open_sqlite_fts5_database()
+    
+    # Reindex if needed
+    if needs_reindex():
+        index_sessions()
+        index_memory_files()
+        index_rules()
+    
+    # Full-text search
+    results = db.search(
+        query: escape_fts_query(query),
+        filter: kind,
+        limit: 10
+    )
+    
+    return format_results(results)
+
+function memory_write(component, summary, details):
+    memory_file = open(MEMORY.md, append)
+    
+    entry = format("""
+    ## {component} — {timestamp}
+    **Summary:** {summary}
+    {details}
+    """)
+    
+    write(memory_file, entry)
+
+8. COMPACTOR (internal/compactor/)
+----------------------------------------
+function maybe_compact(session):
+    config = get_compact_config()
+    messages = session.get_messages()
+    
+    # Check turn count and token thresholds
+    if should_compact_based_on_thresholds():
+        compact_messages(messages)
+
+function compact_messages(messages):
+    # Keep recent messages intact
+    split_point = find_split(messages, keep_recent=3)
+    
+    to_compress = messages[:split_point]
+    to_keep = messages[split_point:]
+    
+    # Summarize with Haiku (fast/cheap model)
+    summary = call_claude_haiku(
+        prompt=COMPACTION_PROMPT,
+        transcript=flatten_messages(to_compress)
+    )
+    
+    # Create marker message
+    marker = create_compaction_marker(summary, to_compress)
+    
+    # Replace old messages with marker
+    return [marker] + to_keep
+
+9. REFLECTION (internal/reflect/)
+----------------------------------------
+function reflect_on_session(session):
+    messages = session.get_messages()
+    
+    # Extract work done
+    files_changed = extract_file_changes(messages)
+    decisions_made = extract_decisions(messages)
+    
+    if files_changed.empty() and decisions_made.empty():
+        return  # Nothing meaningful to remember
+    
+    # Generate reflection prompt
+    prompt = create_reflection_prompt(messages)
+    
+    # Call Claude to generate memory entries
+    reflection = call_claude(prompt)
+    
+    # Write to MEMORY.md
+    for entry in reflection.memory_entries:
+        memory_write(entry.component, entry.summary, entry.details)
+
+10. REPOSITORY MAP (internal/repomap/)
+-----------------------------------------
+function build_repo_map():
+    # Find code files, extract symbols by language
+    # Return formatted repository context
+
+KEY FEATURES:
+- Multi-step agent reasoning with tool use
+- Persistent sessions with automatic compaction  
+- Terminal UI with real-time streaming
+- Memory system with full-text search
+- Safe command execution 
+- Web search integration
+- Automatic reflection
+- Repository understanding
+- Atomic file editing
