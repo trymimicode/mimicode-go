@@ -29,17 +29,22 @@ jobs:
 
     - name: Build release binaries
       run: |
+        VERSION=${GITHUB_REF#refs/tags/}
+        COMMIT=$(git rev-parse --short HEAD)
+        BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        LDFLAGS="-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.buildDate=$BUILD_DATE"
+        
         # Linux amd64
-        GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o mimicode-linux-amd64 ./cmd/mimicode
+        GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o mimicode-linux-amd64 ./cmd/mimicode
         
         # Linux arm64
-        GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o mimicode-linux-arm64 ./cmd/mimicode
+        GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o mimicode-linux-arm64 ./cmd/mimicode
         
         # macOS amd64
-        GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o mimicode-darwin-amd64 ./cmd/mimicode
+        GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o mimicode-darwin-amd64 ./cmd/mimicode
         
         # macOS arm64
-        GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o mimicode-darwin-arm64 ./cmd/mimicode
+        GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o mimicode-darwin-arm64 ./cmd/mimicode
         
         # Create checksums
         sha256sum mimicode-* > checksums.txt
