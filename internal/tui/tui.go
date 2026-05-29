@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -37,6 +38,15 @@ type line struct {
 	Diff *tools.DiffInfo
 }
 
+// readingFile tracks the animated "reading" state for a single file.
+type readingFile struct {
+	path    string
+	lines   []string
+	cursor  int
+	speed   int
+	lineIdx int // index in m.lines where the placeholder sits
+}
+
 type model struct {
 	session  *store.Session
 	cwd      string
@@ -48,35 +58,44 @@ type model struct {
 	height   int
 	cursor   int
 
-	running     bool
-	cancel      context.CancelFunc
-	step        int
-	spinner     int
-	lastTool    string
-	toolStatus  string
-	modelName   string
-	streamText  string
-	currentCost float64
-	enterSubmit bool
+	running        bool
+	cancel         context.CancelFunc
+	step           int
+	spinner        int
+	lastTool       string
+	toolStatus     string
+	modelName      string
+	streamText     string
+	currentCost    float64
 	showOnboarding bool
-	history     []string
-	historyIdx  int
+	history        []string
+	historyIdx     int
 
-	program *tea.Program
+	reading      *readingFile // active reading animation, nil when idle
+	allToolLines []line       // tool diffs/reads accumulated across all turns
+
+	program    *tea.Program
+	lineCache  []string // cached output of renderedLines()
+	cacheDirty bool     // true when lineCache must be recomputed
 }
 
 var (
-	userStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
-	assistantStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("86"))
-	toolStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	statusStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("236"))
-	inputStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("229"))
-	errorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	toolBarStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Background(lipgloss.Color("237"))
-	diffAddStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("34")).Background(lipgloss.Color("22"))
-	diffRemStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Background(lipgloss.Color("52"))
-	diffLineStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	diffFileStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
+	userStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
+	assistantStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("86"))
+	toolStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	statusStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("236"))
+	inputStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("229"))
+	errorStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	toolBarStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Background(lipgloss.Color("237"))
+	diffFileStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
+	diffLineNumStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	diffAddMarkStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("34")).Bold(true)  // green + and line num
+	diffRemMarkStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true) // red - and line num
+	diffCodeStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))            // near-white for added code
+	diffFadedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))            // grey for removed code
+	readCursorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Background(lipgloss.Color("238")).Bold(true)
+	readDimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	streamHeadStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true) // headers during streaming
 )
 
 func RunTUI(sessionID string) error {
@@ -98,7 +117,6 @@ func RunTUI(sessionID string) error {
 		history:  []string{},
 		historyIdx: -1,
 	}
-	m.enterSubmit = os.Getenv("MIMICODE_TUI_ENTER_SUBMITS") == "1"
 	// Show onboarding if this is a new session with no messages
 	m.showOnboarding = len(messages) == 0
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -116,34 +134,64 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.bumpCache()
 		m.clampScroll()
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	case streamMsg:
 		m.handleStream(msg)
 	case turnDoneMsg:
+		// If reading was still animating, finalize it now.
+		if m.reading != nil {
+			summary := line{Kind: "tool", Text: fmt.Sprintf("read %s (%d lines)", filepath.Base(m.reading.path), len(m.reading.lines))}
+			if m.reading.lineIdx < len(m.lines) {
+				m.lines[m.reading.lineIdx] = summary
+			}
+			m.allToolLines = append(m.allToolLines, summary)
+			m.reading = nil
+		}
+		// Promote streaming assistant lines to permanent (triggers full glamour render).
+		for i, l := range m.lines {
+			if l.Kind == "assistant_stream" {
+				m.lines[i].Kind = "assistant"
+			}
+		}
 		m.running = false
 		m.cancel = nil
 		m.toolStatus = ""
-		m.spinner = 0  // Reset spinner to fix stuck loader
+		m.spinner = 0
 		m.messages = msg.Messages
 		m.currentCost = estimateCost(msg.Usage)
-		m.lines = renderMessages(m.messages)
 		if msg.Err != nil {
 			m.lines = append(m.lines, line{Kind: "error", Text: "error: " + msg.Err.Error()})
 		}
-		_ = m.session.SaveMessages(m.messages)
-		next, record, err := compactor.MaybeCompact(context.Background(), m.messages, m.session.Path(), msg.Usage.InputTokens)
-		if err == nil && record != nil {
-			m.messages = next
+		if m.session != nil {
 			_ = m.session.SaveMessages(m.messages)
-			m.lines = renderMessages(m.messages)
+			next, record, err := compactor.MaybeCompact(context.Background(), m.messages, m.session.Path(), msg.Usage.InputTokens)
+			if err == nil && record != nil {
+				m.messages = next
+				_ = m.session.SaveMessages(m.messages)
+				m.lines = append(renderMessages(m.messages), m.allToolLines...)
+			}
 		}
+		m.bumpCache()
 		m.scrollToBottom()
 	case tickMsg:
 		if m.running {
 			m.spinner++
 			m.replaceStreamingAssistant()
+			if m.reading != nil {
+				m.reading.cursor += m.reading.speed
+				m.bumpCache() // cursor advanced, re-render reading window
+				if m.reading.cursor >= len(m.reading.lines) {
+					summary := line{Kind: "tool", Text: fmt.Sprintf("read %s (%d lines)", filepath.Base(m.reading.path), len(m.reading.lines))}
+					if m.reading.lineIdx < len(m.lines) {
+						m.lines[m.reading.lineIdx] = summary
+					}
+					m.allToolLines = append(m.allToolLines, summary)
+					m.reading = nil
+				}
+			}
 			m.scrollToBottom()
 			return m, tick()
 		}
@@ -159,6 +207,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.running && m.cancel != nil {
 			m.cancel()
 			m.lines = append(m.lines, line{Kind: "tool", Text: "cancel requested"})
+			m.bumpCache()
 			m.scrollToBottom()
 			return m, nil
 		}
@@ -168,7 +217,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.showOnboarding {
 				m.showOnboarding = false
 			} else if msg.Alt {
-				// Alt+Enter = new line (Shift+Enter is not distinguishable in terminals)
 				left := m.input[:m.cursor]
 				right := m.input[m.cursor:]
 				m.input = left + "\n" + right
@@ -387,11 +435,7 @@ func (m *model) View() string {
 	if m.running {
 		status += fmt.Sprintf(" step=%d", m.step)
 	} else {
-		if m.enterSubmit {
-			status += " [Enter=Send, Shift+Enter=Newline]"
-		} else {
-			status += " [Shift+Enter=Newline, Ctrl+J=Send]"
-		}
+		status += " [Enter=Send  Alt+Enter=Newline]"
 	}
 	b.WriteString(statusStyle.Width(max(1, m.width)).Render(status))
 	b.WriteString("\n")
@@ -449,7 +493,8 @@ func (m *model) submit() {
 			Text: prompt,
 		}},
 	})
-	m.lines = renderMessages(m.messages)
+	m.lines = append(m.lines, line{Kind: "user", Text: prompt})
+	m.bumpCache()
 	m.scrollToBottom()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -498,7 +543,7 @@ func (m *model) handleStream(msg streamMsg) {
 		newContent, _ := msg.Data["new_content"].(string)
 		operation, _ := msg.Data["operation"].(string)
 		isNewFile, _ := msg.Data["is_new_file"].(bool)
-		m.lines = append(m.lines, line{
+		l := line{
 			Kind: "diff",
 			Diff: &tools.DiffInfo{
 				Path:       path,
@@ -507,8 +552,32 @@ func (m *model) handleStream(msg streamMsg) {
 				Operation:  operation,
 				IsNewFile:  isNewFile,
 			},
-		})
+		}
+		m.lines = append(m.lines, l)
+		m.allToolLines = append(m.allToolLines, l)
+		m.bumpCache()
 		m.scrollToBottom()
+	case "file_read":
+		path, _ := msg.Data["path"].(string)
+		output, _ := msg.Data["output"].(string)
+		lines := parseReadOutput(output)
+		if len(lines) > 0 {
+			speed := len(lines) / 40
+			if speed < 2 {
+				speed = 2
+			}
+			lineIdx := len(m.lines)
+			m.lines = append(m.lines, line{Kind: "reading", Text: path})
+			m.reading = &readingFile{
+				path:    path,
+				lines:   lines,
+				cursor:  0,
+				speed:   speed,
+				lineIdx: lineIdx,
+			}
+			m.bumpCache()
+			m.scrollToBottom()
+		}
 	}
 }
 
@@ -518,16 +587,37 @@ func (m *model) replaceStreamingAssistant() {
 	}
 	if len(m.lines) > 0 && m.lines[len(m.lines)-1].Kind == "assistant_stream" {
 		m.lines[len(m.lines)-1].Text = m.streamText
+		m.bumpCache()
 		return
 	}
 	m.lines = append(m.lines, line{Kind: "assistant_stream", Text: m.streamText})
+	m.bumpCache()
+}
+
+func (m *model) bumpCache() {
+	m.cacheDirty = true
 }
 
 func (m *model) renderedLines() []string {
+	if !m.cacheDirty && m.lineCache != nil {
+		return m.lineCache
+	}
+	m.lineCache = m.computeRenderedLines()
+	m.cacheDirty = false
+	return m.lineCache
+}
+
+func (m *model) computeRenderedLines() []string {
 	var out []string
-	for _, l := range m.lines {
+	for i, l := range m.lines {
 		switch l.Kind {
-		case "assistant", "assistant_stream":
+		case "reading":
+			if m.reading != nil && m.reading.lineIdx == i {
+				out = append(out, renderReadingWindow(m.reading, m.width)...)
+			} else {
+				out = append(out, toolStyle.Render(l.Text))
+			}
+		case "assistant":
 			rendered := renderMarkdown(l.Text, m.width)
 			rendered = strings.TrimLeft(rendered, "\n")
 			lines := strings.Split(rendered, "\n")
@@ -538,6 +628,44 @@ func (m *model) renderedLines() []string {
 					dotPlaced = true
 				} else {
 					out = append(out, physical)
+				}
+			}
+		case "assistant_stream":
+			// Don't run glamour on incomplete streaming text — it mangles partial markdown.
+			// Do a lightweight pass to render headers and plain text.
+			lines := strings.Split(l.Text, "\n")
+			dotPlaced := false
+			for _, physical := range lines {
+				trimmed := strings.TrimSpace(physical)
+				if strings.HasPrefix(trimmed, "#") {
+					// Count leading # chars to determine heading level
+					level := 0
+					for _, ch := range trimmed {
+						if ch == '#' {
+							level++
+						} else {
+							break
+						}
+					}
+					text := strings.TrimSpace(trimmed[level:])
+					prefix := strings.Repeat("─", level) + " "
+					rendered := streamHeadStyle.Render(prefix + text)
+					if !dotPlaced {
+						out = append(out, assistantStyle.Render("● ")+rendered)
+						dotPlaced = true
+					} else {
+						out = append(out, rendered)
+					}
+					continue
+				}
+				wrapped := wrapText(physical, m.width-2)
+				for _, wl := range strings.Split(wrapped, "\n") {
+					if !dotPlaced && strings.TrimSpace(wl) != "" {
+						out = append(out, assistantStyle.Render("● ")+wl)
+						dotPlaced = true
+					} else {
+						out = append(out, wl)
+					}
 				}
 			}
 		case "diff":
@@ -567,51 +695,106 @@ func (m *model) renderedLines() []string {
 
 func renderDiff(diff *tools.DiffInfo, width int) []string {
 	var out []string
-	
-	// File header
+
 	header := fmt.Sprintf("━━━ %s %s ━━━", diff.Operation, diff.Path)
 	out = append(out, diffFileStyle.Render(header))
-	
+
 	if diff.IsNewFile {
-		out = append(out, diffAddStyle.Render("+ New file"))
+		out = append(out, diffAddMarkStyle.Render("+ new file"))
 		lines := strings.Split(diff.NewContent, "\n")
-		for i, line := range lines {
-			lineNum := fmt.Sprintf("%4d", i+1)
-			out = append(out, diffLineStyle.Render(lineNum)+" "+diffAddStyle.Render("+ "+line))
+		for i, ln := range lines {
+			num := diffAddMarkStyle.Render(fmt.Sprintf("%4d", i+1))
+			plus := diffAddMarkStyle.Render(" + ")
+			code := diffCodeStyle.Render(ln)
+			out = append(out, num+plus+code)
 		}
 	} else {
-		// Generate line-by-line diff
 		oldLines := strings.Split(diff.OldContent, "\n")
 		newLines := strings.Split(diff.NewContent, "\n")
-		
-		// Simple diff algorithm - show removed lines then added lines
 		maxOld := len(oldLines)
 		maxNew := len(newLines)
-		
+
 		i, j := 0, 0
 		for i < maxOld || j < maxNew {
 			if i < maxOld && j < maxNew && oldLines[i] == newLines[j] {
-				// Unchanged line
-				lineNum := fmt.Sprintf("%4d", i+1)
-				out = append(out, diffLineStyle.Render(lineNum)+"  "+oldLines[i])
+				num := diffLineNumStyle.Render(fmt.Sprintf("%4d", i+1))
+				out = append(out, num+"   "+oldLines[i])
 				i++
 				j++
 			} else if i < maxOld {
-				// Removed line
-				lineNum := fmt.Sprintf("%4d", i+1)
-				out = append(out, diffLineStyle.Render(lineNum)+" "+diffRemStyle.Render("- "+oldLines[i]))
+				num := diffRemMarkStyle.Render(fmt.Sprintf("%4d", i+1))
+				dash := diffRemMarkStyle.Render(" - ")
+				code := diffFadedStyle.Render(oldLines[i])
+				out = append(out, num+dash+code)
 				i++
-			} else if j < maxNew {
-				// Added line
-				lineNum := fmt.Sprintf("%4d", j+1)
-				out = append(out, diffLineStyle.Render(lineNum)+" "+diffAddStyle.Render("+ "+newLines[j]))
+			} else {
+				num := diffAddMarkStyle.Render(fmt.Sprintf("%4d", j+1))
+				plus := diffAddMarkStyle.Render(" + ")
+				code := diffCodeStyle.Render(newLines[j])
+				out = append(out, num+plus+code)
 				j++
 			}
 		}
 	}
-	
+
 	out = append(out, "")
 	return out
+}
+
+// renderReadingWindow draws the animated file reading view.
+// A 13-line window is centered on the cursor line.
+func renderReadingWindow(r *readingFile, width int) []string {
+	var out []string
+
+	header := fmt.Sprintf(" ▶ reading  %s ", filepath.Base(r.path))
+	out = append(out, diffFileStyle.Render(header))
+
+	const windowSize = 13
+	start := r.cursor - windowSize/2
+	if start < 0 {
+		start = 0
+	}
+	end := start + windowSize
+	if end > len(r.lines) {
+		end = len(r.lines)
+		if start = end - windowSize; start < 0 {
+			start = 0
+		}
+	}
+
+	maxContent := width - 8
+	if maxContent < 10 {
+		maxContent = 10
+	}
+
+	for i := start; i < end; i++ {
+		lineNum := fmt.Sprintf("%4d", i+1)
+		content := r.lines[i]
+		if len(content) > maxContent {
+			content = content[:maxContent]
+		}
+		if i == r.cursor {
+			out = append(out, diffLineNumStyle.Render(lineNum)+" "+readCursorStyle.Render("► "+content))
+		} else {
+			out = append(out, diffLineNumStyle.Render(lineNum)+"   "+readDimStyle.Render(content))
+		}
+	}
+
+	progress := fmt.Sprintf("  [line %d / %d]", r.cursor+1, len(r.lines))
+	out = append(out, toolStyle.Render(progress))
+	return out
+}
+
+// parseReadOutput converts the line-numbered output of tools.Read ("  N|content")
+// into a plain slice of content strings.
+func parseReadOutput(output string) []string {
+	var lines []string
+	for _, l := range strings.Split(output, "\n") {
+		if idx := strings.Index(l, "|"); idx >= 0 {
+			lines = append(lines, l[idx+1:])
+		}
+	}
+	return lines
 }
 
 func renderMarkdown(text string, width int) string {
@@ -741,10 +924,7 @@ func renderMessages(messages []provider.Message) []line {
 			case "tool_use":
 				// Skip tool_use blocks in chat display
 			case "tool_result":
-				// Check if this is a diff result
-				if strings.Contains(block.ToolUseID, "diff") {
-					lines = append(lines, line{Kind: "tool", Text: "[tool result] File modified"})
-				}
+				// Tool results are shown via stream events during turns; nothing to render here.
 			}
 		}
 	}
