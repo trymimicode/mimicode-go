@@ -26,35 +26,61 @@ case "$ARCH" in
     *)       echo "❌ Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-# Check if Go is installed for building from source
-if command -v go >/dev/null 2>&1; then
-    echo "✓ Go detected, building from source..."
-    
-    # Create temp directory
-    TMP_DIR=$(mktemp -d)
-    trap "rm -rf $TMP_DIR" EXIT
-    
-    cd "$TMP_DIR"
-    echo "  Cloning repository..."
-    git clone --depth 1 "https://github.com/$REPO.git" .
-    
-    echo "  Building binary..."
-    go build -o "$BINARY_NAME" -ldflags="-s -w" ./cmd/mimicode
-    
-    # Create install directory if it doesn't exist
-    mkdir -p "$INSTALL_DIR"
-    
-    # Install binary
-    mv "$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
-    chmod +x "$INSTALL_DIR/$BINARY_NAME"
-    
-    echo "✓ mimicode installed to $INSTALL_DIR/$BINARY_NAME"
-else
-    echo "❌ Go not found. Please install Go 1.26+ from https://go.dev/dl/"
-    echo "   Or install manually:"
-    echo "   git clone https://github.com/$REPO.git"
-    echo "   cd mimicode-go && make install"
-    exit 1
+# Try downloading pre-built binary from latest release
+BINARY_FILE="$BINARY_NAME-$OS-$ARCH"
+DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$BINARY_FILE"
+
+echo "  Trying to download pre-built binary..."
+if command -v curl >/dev/null 2>&1; then
+    HTTP_CODE=$(curl -L -w "%{http_code}" -o "/tmp/$BINARY_FILE" "$DOWNLOAD_URL" 2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" = "200" ]; then
+        echo "✓ Downloaded pre-built binary"
+        mkdir -p "$INSTALL_DIR"
+        mv "/tmp/$BINARY_FILE" "$INSTALL_DIR/$BINARY_NAME"
+        chmod +x "$INSTALL_DIR/$BINARY_NAME"
+        echo "✓ $BINARY_NAME installed to $INSTALL_DIR/$BINARY_NAME"
+        INSTALLED=1
+    else
+        echo "  No pre-built binary available (HTTP $HTTP_CODE)"
+        rm -f "/tmp/$BINARY_FILE"
+    fi
+fi
+
+# Fall back to building from source if download failed
+if [ -z "$INSTALLED" ]; then
+    if command -v go >/dev/null 2>&1; then
+        echo "✓ Go detected, building from source..."
+        
+        # Create temp directory
+        TMP_DIR=$(mktemp -d)
+        trap "rm -rf $TMP_DIR" EXIT
+        
+        cd "$TMP_DIR"
+        echo "  Cloning repository..."
+        git clone --depth 1 "https://github.com/$REPO.git" .
+        
+        echo "  Building binary..."
+        go build -o "$BINARY_NAME" -ldflags="-s -w" ./cmd/mimicode
+        
+        # Create install directory if it doesn't exist
+        mkdir -p "$INSTALL_DIR"
+        
+        # Install binary
+        mv "$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+        chmod +x "$INSTALL_DIR/$BINARY_NAME"
+        
+        echo "✓ $BINARY_NAME installed to $INSTALL_DIR/$BINARY_NAME"
+    else
+        echo "❌ Could not download pre-built binary and Go is not installed."
+        echo "   Install Go 1.26+ from https://go.dev/dl/ or download manually:"
+        echo "   https://github.com/$REPO/releases"
+        exit 1
+    fi
+fi
+
+# Verify installation
+if ! "$INSTALL_DIR/$BINARY_NAME" --version >/dev/null 2>&1; then
+    echo "⚠️  Installation completed but binary verification failed"
 fi
 
 # Check if ripgrep is installed

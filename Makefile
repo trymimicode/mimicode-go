@@ -5,7 +5,9 @@ BINARY_NAME=mimicode
 CMD_PATH=./cmd/mimicode
 INSTALL_PATH=$(shell go env GOPATH)/bin
 VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
+COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILD_DATE=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)"
 
 # Default target
 all: build
