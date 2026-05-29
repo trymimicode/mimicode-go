@@ -317,8 +317,17 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 				cfg.Session.LogToolExec(turn, step+1, store.ToolExecEvent{ID: tu.ID, Name: tu.Name, Input: tu.Input})
 			}
 			t1 := time.Now()
-			result := dispatchTool(ctx, cfg, tu.Name, tu.Input)
+			result, diffInfo := dispatchTool(ctx, cfg, tu.Name, tu.Input)
 			toolMs := time.Since(t1).Milliseconds()
+			if cfg.StreamCB != nil && diffInfo != nil {
+				cfg.StreamCB("file_change", map[string]any{
+					"path":        diffInfo.Path,
+					"old_content": diffInfo.OldContent,
+					"new_content": diffInfo.NewContent,
+					"operation":   diffInfo.Operation,
+					"is_new_file": diffInfo.IsNewFile,
+				})
+			}
 			result.ToolUseID = tu.ID
 			if cfg.Session != nil {
 				preview := result.Content
@@ -346,9 +355,10 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 	return messages, nil
 }
 
-func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[string]any) provider.ContentBlock {
+func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[string]any) (provider.ContentBlock, *tools.DiffInfo) {
 	var output string
 	var isErr bool
+	var diffInfo *tools.DiffInfo
 
 	switch name {
 	case "bash":
@@ -360,9 +370,11 @@ func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[s
 	case "write":
 		result := tools.Write(ctx, cfg.CWD, stringInput(input, "path"), stringInput(input, "content"))
 		output, isErr = result.Output, result.IsError
+		diffInfo = result.DiffInfo
 	case "edit":
 		result := tools.Edit(ctx, cfg.CWD, stringInput(input, "path"), stringInputAny(input, "old_text", "oldText"), stringInputAny(input, "new_text", "newText"), editInputs(input))
 		output, isErr = result.Output, result.IsError
+		diffInfo = result.DiffInfo
 	case "memory_write":
 		output = memory.HandleMemoryWrite("", input, cfg.CWD)
 		isErr = strings.Contains(strings.ToLower(output), "error")
@@ -397,7 +409,7 @@ func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[s
 		Type:    "tool_result",
 		Content: output,
 		IsError: isErr,
-	}
+	}, diffInfo
 }
 
 func callModel(ctx context.Context, cfg AgentConfig, messages []provider.Message, system, model string) (provider.Message, provider.Usage, error) {
