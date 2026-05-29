@@ -1,8 +1,10 @@
 # mimicode
 
 [![CI](https://github.com/trymimicode/mimicode-go/actions/workflows/ci.yml/badge.svg)](https://github.com/trymimicode/mimicode-go/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/trymimicode/mimicode-go)](https://github.com/trymimicode/mimicode-go/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Go Version](https://img.shields.io/badge/go-1.26-blue.svg)](https://go.dev/dl/)
+[![Go Report Card](https://goreportcard.com/badge/github.com/trymimicode/mimicode-go)](https://goreportcard.com/report/github.com/trymimicode/mimicode-go)
 
 A minimal coding agent for engineers who want to stay in control.
 
