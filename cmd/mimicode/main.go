@@ -74,6 +74,10 @@ func main() {
 }
 
 func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer) int {
+	if len(args) > 0 && args[0] == "watch" {
+		return runWatch(ctx, args[1:], out, errOut)
+	}
+
 	fs := flag.NewFlagSet("mimicode", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 
