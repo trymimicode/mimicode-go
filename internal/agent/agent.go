@@ -79,6 +79,7 @@ type AgentConfig struct {
 	MaxSteps int
 	Session  *store.Session // nil = no logging
 	StreamCB provider.StreamCallback
+	Model    string // empty = use provider.DefaultModel()
 	// ConfirmTool, if set, is called before each mutating tool (bash/write/edit).
 	// Returning false blocks the call. nil = no gating.
 	ConfirmTool func(name string, input map[string]any) bool
@@ -291,7 +292,10 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 	})
 
 	system := BuildSystem(cfg.CWD)
-	model := provider.DefaultModel()
+	model := cfg.Model
+	if model == "" {
+		model = provider.DefaultModel()
+	}
 	sessionDir := ""
 	if cfg.Session != nil {
 		sessionDir = cfg.Session.Path()
@@ -449,6 +453,12 @@ func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[s
 	case "read":
 		result := tools.Read(ctx, cfg.CWD, stringInput(input, "path"), intInput(input, "offset"), intInput(input, "limit"))
 		output, isErr = result.Output, result.IsError
+		if cfg.StreamCB != nil && !isErr && result.Output != "" {
+			cfg.StreamCB("file_read", map[string]any{
+				"path":   stringInput(input, "path"),
+				"output": result.Output,
+			})
+		}
 	case "write":
 		result := tools.Write(ctx, cfg.CWD, stringInput(input, "path"), stringInput(input, "content"))
 		output, isErr = result.Output, result.IsError
