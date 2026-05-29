@@ -76,6 +76,7 @@ type AgentConfig struct {
 	MaxSteps int
 	Session  *store.Session // nil = no logging
 	StreamCB provider.StreamCallback
+	Model    string // empty = use provider.DefaultModel()
 }
 
 type AgentInterrupted struct{}
@@ -258,7 +259,10 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 	})
 
 	system := BuildSystem(cfg.CWD)
-	model := provider.DefaultModel()
+	model := cfg.Model
+	if model == "" {
+		model = provider.DefaultModel()
+	}
 	sessionDir := ""
 	if cfg.Session != nil {
 		sessionDir = cfg.Session.Path()
