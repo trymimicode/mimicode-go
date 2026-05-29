@@ -14,6 +14,7 @@ import (
 	"github.com/trymimicode/mimicode-go/internal/agent"
 	"github.com/trymimicode/mimicode-go/internal/compactor"
 	"github.com/trymimicode/mimicode-go/internal/provider"
+	"github.com/trymimicode/mimicode-go/internal/reflect"
 	"github.com/trymimicode/mimicode-go/internal/store"
 )
 
@@ -76,6 +77,11 @@ func RunTUI(sessionID string) error {
 	if err != nil {
 		return fmt.Errorf("start session: %w", err)
 	}
+	defer func() {
+		rctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		_ = reflect.RunReflect(rctx, sess, cwd)
+	}()
 
 	m := &model{
 		session:  sess,

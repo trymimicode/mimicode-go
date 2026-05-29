@@ -131,6 +131,7 @@ func runOneShot(ctx context.Context, sessionID, cwd, prompt string, in io.Reader
 	if !ok {
 		return 1
 	}
+	defer reflectSession(sess, cwd, errOut)
 
 	cp := checkpoint.New(sess.Path(), cwd)
 	cp.Snapshot("session start")
@@ -166,7 +167,6 @@ func runOneShot(ctx context.Context, sessionID, cwd, prompt string, in io.Reader
 	if text := extractLastAssistantText(messages); text != "" {
 		fmt.Fprintln(out, text)
 	}
-	reflectSession(ctx, sess, cwd)
 	return 0
 }
 
@@ -175,6 +175,7 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 	if !ok {
 		return 1
 	}
+	defer reflectSession(sess, cwd, errOut)
 	cfg := agent.AgentConfig{CWD: cwd, Session: sess, MaxSteps: 25}
 	cp := checkpoint.New(sess.Path(), cwd)
 	cp.Snapshot("session start")
@@ -254,7 +255,6 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 		}
 	}
 
-	reflectSession(ctx, sess, cwd)
 	return 0
 }
 
@@ -471,9 +471,12 @@ func printAgentErr(errOut io.Writer, err error) {
 	fmt.Fprintf(errOut, "mimicode: agent: %v\n", err)
 }
 
-func reflectSession(ctx context.Context, sess *store.Session, cwd string) {
-	reflectCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+// reflectSession runs the post-session reflection. It uses a fresh context
+// (not the request ctx) so it still runs when the session was interrupted.
+func reflectSession(sess *store.Session, cwd string, errOut io.Writer) {
+	reflectCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	fmt.Fprintln(errOut, "reflecting on session…")
 	_ = runReflect(reflectCtx, sess, cwd)
 }
 

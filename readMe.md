@@ -1,5 +1,9 @@
 # mimicode
 
+[![CI](https://github.com/trymimicode/mimicode-go/actions/workflows/ci.yml/badge.svg)](https://github.com/trymimicode/mimicode-go/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Go Version](https://img.shields.io/badge/go-1.26-blue.svg)](https://go.dev/dl/)
+
 A minimal coding agent for engineers who want to stay in control.
 
 mimi does one thing: offloads the rote work — grepping through codebases, looking up docs,
@@ -13,6 +17,22 @@ Memory is flat markdown in `.mimi/MEMORY.md`. No black boxes.
 
 ---
 
+## Quick Start
+
+```sh
+# Install (requires Go 1.26+ and ripgrep)
+curl -fsSL https://raw.githubusercontent.com/trymimicode/mimicode-go/main/install.sh | bash
+
+# Set your API key
+export ANTHROPIC_API_KEY="your-key-here"
+
+# Run
+mimicode "add tests to calc.go"
+mimicode --tui  # terminal UI with streaming
+```
+
+---
+
 ## requirements
 
 - [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) — mimi uses it for all searches
@@ -20,12 +40,43 @@ Memory is flat markdown in `.mimi/MEMORY.md`. No black boxes.
 
 ---
 
-## build
+## installation
+
+**Quick install** (requires Go 1.26+):
+```sh
+curl -fsSL https://raw.githubusercontent.com/trymimicode/mimicode-go/main/install.sh | bash
+```
+
+**Or install via Go**:
+```sh
+go install github.com/trymimicode/mimicode-go/cmd/mimicode@latest
+```
+
+**Or build from source**:
+```sh
+git clone https://github.com/trymimicode/mimicode-go.git
+cd mimicode-go
+make install
+```
+
+**Set your API key**:
+```sh
+export ANTHROPIC_API_KEY="your-key-here"
+# Add to ~/.zshrc or ~/.bashrc to persist
+```
+
+---
+
+## development
 
 ```sh
-make build    # → ./mimicode
-make install  # → $GOPATH/bin/mimicode
-make test
+make build       # → ./mimicode
+make install     # → $GOPATH/bin/mimicode
+make test        # run all tests
+make fmt         # format code
+make vet         # run go vet
+make dev         # build and run in TUI mode
+make help        # show all targets
 ```
 
 ---
