@@ -22,6 +22,27 @@ func LoadRules(cwd string) string {
 	return readFile(filepath.Join(mimiDir(cwd), "RULES.md"))
 }
 
+// AppendRule appends a single behavioral rule to .mimi/RULES.md, dated.
+// Used by the self-recovery loop to record a lesson learned from a failure.
+func AppendRule(cwd, rule string) error {
+	rule = strings.TrimSpace(rule)
+	if rule == "" {
+		return fmt.Errorf("empty rule")
+	}
+	dir := mimiDir(cwd)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "RULES.md")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "- %s _(learned %s)_\n", rule, time.Now().UTC().Format("2006-01-02"))
+	return err
+}
+
 func readFile(path string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
