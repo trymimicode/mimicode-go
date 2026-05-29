@@ -1,3 +1,7 @@
+// Package reflect runs a post-session pass over the event-log decision trace.
+// It summarizes what happened (→ MEMORY.md) and extracts durable behavioral
+// rules to make future sessions better (→ RULES.md). It runs at session end,
+// including when the session is interrupted, so it must use a fresh context.
 package reflect
 
 import (
@@ -9,85 +13,104 @@ import (
 	"strings"
 	"time"
 
+	"github.com/trymimicode/mimicode-go/internal/memory"
 	"github.com/trymimicode/mimicode-go/internal/provider"
 	"github.com/trymimicode/mimicode-go/internal/store"
 )
 
+const reflectPrompt = `You are reviewing a finished coding-agent session. Produce (1) a short summary and (2) durable behavioral rules that would help future sessions.
+
+Be STRICT about rules: include one only if the log shows a real, repeatable mistake, inefficiency, or user correction worth preventing. Never repeat a rule that already exists.
+
+Existing rules (do NOT repeat these):
+%s
+
+Session event log (each line is a step: model text + tool calls, a tool result with errors/timing, or a turn_end with its reason):
+%s
+
+Return ONLY a JSON object — no prose, no code fences:
+{"summary": "<2-3 sentence recap, or empty string if nothing meaningful happened>", "rules": ["<imperative behavioral rule>", ...]}
+Keep rules few and high-value (0-3). Use an empty array if none are warranted.`
+
+const maxTraceBytes = 14_000
+
+var callClaude = provider.CallClaude
+
+type reflection struct {
+	Summary string   `json:"summary"`
+	Rules   []string `json:"rules"`
+}
+
+// RunReflect reads the session's event log and, if the session did real work,
+// writes a summary to MEMORY.md and any extracted rules to RULES.md.
 func RunReflect(ctx context.Context, sess *store.Session, cwd string) error {
-	messages, err := sess.LoadMessages()
-	if err != nil {
-		warn("load messages: %v", err)
-		return nil
-	}
-	if userTurnCount(messages) < 2 {
+	trace := readEventTail(sess.Path())
+	// Skip trivial / pure-chat sessions: no tool calls means nothing to learn.
+	if !strings.Contains(trace, `"kind":"tool_exec"`) {
 		return nil
 	}
 
-	prompt := "Summarize this coding session in 2-3 sentences. What was accomplished? What files changed? Any unresolved issues? Session transcript:\n" + flattenMessages(messages)
-	response, _, err := provider.CallClaude(ctx, []provider.Message{{
-		Role: "user",
-		Content: []provider.ContentBlock{{
-			Type: "text",
-			Text: prompt,
-		}},
+	prompt := fmt.Sprintf(reflectPrompt, existingRulesOrNone(cwd), trace)
+	resp, _, err := callClaude(ctx, []provider.Message{{
+		Role:    "user",
+		Content: []provider.ContentBlock{{Type: "text", Text: prompt}},
 	}}, "", nil, provider.ModelHaiku)
 	if err != nil {
 		warn("reflect call: %v", err)
 		return nil
 	}
 
-	text := responseText(response)
-	if text == "" {
-		return nil
+	r := parseReflection(responseText(resp))
+	if r.Summary != "" {
+		if err := appendMemory(cwd, sess.ID, r.Summary); err != nil {
+			warn("append memory: %v", err)
+		}
 	}
-	if err := appendMemory(cwd, sess.ID, text); err != nil {
-		warn("append memory: %v", err)
+	for _, rule := range r.Rules {
+		if strings.TrimSpace(rule) == "" {
+			continue
+		}
+		if err := memory.AppendRule(cwd, rule); err != nil {
+			warn("append rule: %v", err)
+		}
 	}
 	return nil
 }
 
-func userTurnCount(messages []provider.Message) int {
-	var count int
-	for _, msg := range messages {
-		if msg.Role == "user" && !isToolResultOnly(msg) {
-			count++
-		}
+func parseReflection(raw string) reflection {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+
+	var r reflection
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		// Fall back to treating the whole reply as a summary.
+		return reflection{Summary: raw}
 	}
-	return count
+	return r
 }
 
-func isToolResultOnly(msg provider.Message) bool {
-	if len(msg.Content) == 0 {
-		return false
+func existingRulesOrNone(cwd string) string {
+	if rules := strings.TrimSpace(memory.LoadRules(cwd)); rules != "" {
+		return rules
 	}
-	for _, block := range msg.Content {
-		if block.Type != "tool_result" {
-			return false
-		}
-	}
-	return true
+	return "(none yet)"
 }
 
-func flattenMessages(messages []provider.Message) string {
-	var b strings.Builder
-	for _, msg := range messages {
-		for _, block := range msg.Content {
-			switch block.Type {
-			case "text":
-				fmt.Fprintf(&b, "[%s] %s\n", msg.Role, block.Text)
-			case "tool_use":
-				if path, ok := block.Input["path"].(string); ok && path != "" {
-					fmt.Fprintf(&b, "[%s tool_use:%s] path=%s\n", msg.Role, block.Name, path)
-					continue
-				}
-				input, _ := json.Marshal(block.Input)
-				fmt.Fprintf(&b, "[%s tool_use:%s] %s\n", msg.Role, block.Name, truncate(string(input), 300))
-			case "tool_result":
-				fmt.Fprintf(&b, "[%s tool_result:%s] %s\n", msg.Role, block.ToolUseID, truncate(block.Content, 600))
-			}
+func readEventTail(sessionDir string) string {
+	data, err := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
+	if err != nil {
+		return ""
+	}
+	if len(data) > maxTraceBytes {
+		data = data[len(data)-maxTraceBytes:]
+		if i := strings.IndexByte(string(data), '\n'); i >= 0 {
+			data = data[i+1:]
 		}
 	}
-	return b.String()
+	return string(data)
 }
 
 func responseText(message provider.Message) string {
@@ -113,13 +136,6 @@ func appendMemory(cwd, sessionID, text string) error {
 	defer f.Close()
 	_, err = fmt.Fprintf(f, "## session-reflect: %s — %s\n%s\n\n", sessionID, time.Now().UTC().Format(time.RFC3339), text)
 	return err
-}
-
-func truncate(s string, limit int) string {
-	if len(s) <= limit {
-		return s
-	}
-	return s[:limit] + "... (truncated)"
 }
 
 func warn(format string, args ...any) {

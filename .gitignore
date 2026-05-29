@@ -1,6 +1,25 @@
+# Environment
 .env
+
+# Build artifacts
+/mimicode
+/mimicode.exe
+*.exe
+*.out
+coverage.html
+
+# Runtime data
 *.db
 sessions/
 .mimi/
-/mimicode
-/mimicode.exe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
