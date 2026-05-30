@@ -83,7 +83,7 @@ func TestREPLSmokeWithFakeAgent(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := runCLI(context.Background(), nil, strings.NewReader("hello\n:q\n"), &stdout, &stderr)
+	code := runCLI(context.Background(), []string{"--repl"}, strings.NewReader("hello\n:q\n"), &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("runCLI exit code = %d, stderr:\n%s", code, stderr.String())
 	}
@@ -119,7 +119,7 @@ func TestCLIFlagsSessionAndPrompt(t *testing.T) {
 	}
 }
 
-func TestCLIFlagsNoPromptEntersREPL(t *testing.T) {
+func TestCLIFlagsReplEntersREPL(t *testing.T) {
 	hooks := captureHooks()
 	defer restoreHooks(hooks)
 
@@ -130,7 +130,7 @@ func TestCLIFlagsNoPromptEntersREPL(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := runCLI(context.Background(), nil, strings.NewReader(":q\n"), &stdout, &stderr)
+	code := runCLI(context.Background(), []string{"--repl"}, strings.NewReader(":q\n"), &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("runCLI exit code = %d, stderr:\n%s", code, stderr.String())
 	}

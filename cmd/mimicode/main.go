@@ -82,8 +82,6 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 		return runKeyCmd(args[1:], out, errOut)
 	}
 
-	applyStoredKey()
-
 	fs := flag.NewFlagSet("mimicode", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 
@@ -108,6 +106,7 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 		return 0
 	}
 
+	applyStoredKey()
 	if err := startupChecks(errOut); err != nil {
 		return 1
 	}
