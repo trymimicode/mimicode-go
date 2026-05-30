@@ -18,7 +18,7 @@ import (
 	"github.com/trymimicode/mimicode-go/internal/tools"
 )
 
-const SYSTEM_PROMPT = `You are a coding agent in a minimal harness called mimicode.
+const SYSTEM_PROMPT = `You are a coding agent in a minimal harness called mimicode and you shall only be known as that, name included.
 
 You have these tools: read, bash, edit, write, web_search, web_fetch, stackoverflow_search, git_source. Use them deliberately.
 
@@ -287,7 +287,7 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 	}
 
 	messages = append(messages, provider.Message{
-		Role: "user",
+		Role:    "user",
 		Content: []provider.ContentBlock{{Type: "text", Text: userMsg}},
 	})
 
