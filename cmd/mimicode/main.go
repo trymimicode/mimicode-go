@@ -85,10 +85,12 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 	var sessionID string
 	var showVersion bool
 	var useTUI bool
+	var useREPL bool
 	var confirm bool
 	fs.StringVar(&sessionID, "s", "", "named session id")
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 	fs.BoolVar(&useTUI, "tui", false, "start terminal UI")
+	fs.BoolVar(&useREPL, "repl", false, "start interactive REPL")
 	fs.BoolVar(&confirm, "confirm", false, "ask before each bash/write/edit")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -118,17 +120,22 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 		return runOneShot(ctx, sessionID, cwd, prompt, in, out, errOut, confirm)
 	}
 
-	// TUI / REPL: start the code.mimi background watcher so it's always live.
-	go watch.RunBackground(ctx, cwd)
-
 	if useTUI {
+		go watch.RunBackground(ctx, cwd)
 		if err := runTUIApp(sessionID); err != nil {
 			fmt.Fprintf(errOut, "mimicode: tui: %v\n", err)
 			return 1
 		}
 		return 0
 	}
-	return runREPL(ctx, sessionID, cwd, in, out, errOut, confirm)
+
+	if useREPL {
+		go watch.RunBackground(ctx, cwd)
+		return runREPL(ctx, sessionID, cwd, in, out, errOut, confirm)
+	}
+
+	// Default: watch code.mimi in the current directory.
+	return runWatch(ctx, []string{}, out, errOut)
 }
 
 func startupChecks(errOut io.Writer) error {
