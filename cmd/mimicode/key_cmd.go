@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type mimicodeConfig struct {
@@ -33,6 +35,8 @@ func loadConfig() (mimicodeConfig, error) {
 	if err != nil {
 		return mimicodeConfig{}, err
 	}
+	// Strip UTF-8 BOM if present (written by some editors/tools on Windows).
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
 	var cfg mimicodeConfig
 	return cfg, json.Unmarshal(data, &cfg)
 }
@@ -61,7 +65,7 @@ func applyStoredKey() {
 	if err != nil || cfg.AnthropicAPIKey == "" {
 		return
 	}
-	_ = setenv("ANTHROPIC_API_KEY", cfg.AnthropicAPIKey)
+	_ = setenv("ANTHROPIC_API_KEY", strings.TrimSpace(cfg.AnthropicAPIKey))
 }
 
 func runKeyCmd(args []string, out, errOut io.Writer) int {
@@ -83,7 +87,11 @@ func runKeyCmd(args []string, out, errOut io.Writer) int {
 			fmt.Fprintf(errOut, "mimicode: load config: %v\n", err)
 			return 1
 		}
-		cfg.AnthropicAPIKey = setKey
+		// Strip an env-var prefix like "ANTHROPIC_API_KEY=sk-ant-..." if present.
+		if i := strings.IndexByte(setKey, '='); i >= 0 {
+			setKey = setKey[i+1:]
+		}
+		cfg.AnthropicAPIKey = strings.TrimSpace(setKey)
 		if err := saveConfig(cfg); err != nil {
 			fmt.Fprintf(errOut, "mimicode: save config: %v\n", err)
 			return 1

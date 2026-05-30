@@ -110,6 +110,13 @@ func Run(ctx context.Context, cfg Config) error {
 
 	state := readState(cfg.Dir)
 
+	// Clear a stale Processing flag left by a crashed previous run so the loop
+	// doesn't skip every tick forever.
+	if state.Processing {
+		state.Processing = false
+		writeState(cfg.Dir, state)
+	}
+
 	// On first run (no prior state), anchor the offset at the current end of the
 	// file so we don't fire on existing content.
 	if state.ProcessedOffset == 0 {
@@ -137,7 +144,16 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 
 			info, err := os.Stat(cfg.NotebookPath)
-			if err != nil || info.Size() <= state.ProcessedOffset {
+			if err != nil {
+				continue
+			}
+			// File was truncated (e.g. user cleared it). Reset offset so new writes fire.
+			if info.Size() < state.ProcessedOffset {
+				state.ProcessedOffset = info.Size()
+				writeState(cfg.Dir, state)
+				continue
+			}
+			if info.Size() == state.ProcessedOffset {
 				continue
 			}
 
@@ -314,10 +330,7 @@ func ensureNotebook(path string) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
-	header := "# write here — save to send to mimi.\n" +
-		"# mimi reads what you add, responds, and appends its answer below.\n" +
-		"# keep going: just write more at the end and save again.\n\n"
-	return os.WriteFile(path, []byte(header), 0o644)
+	return os.WriteFile(path, []byte(""), 0o644)
 }
 
 // ── Backward-compat helpers (kept for existing tests) ────────────────────────
