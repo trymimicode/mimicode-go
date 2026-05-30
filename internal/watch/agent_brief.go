@@ -32,6 +32,7 @@ func NewAgentBriefer(sessionID, cwd string) (Briefer, *store.Session, error) {
 		if prompt == "" {
 			return "", nil
 		}
+		before := st.messages
 		next, err := agent.AgentTurn(ctx, agent.AgentConfig{
 			CWD:      st.cwd,
 			Session:  st.sess,
@@ -42,26 +43,64 @@ func NewAgentBriefer(sessionID, cwd string) (Briefer, *store.Session, error) {
 		}
 		st.messages = next
 		_ = st.sess.SaveMessages(next)
-		return lastAssistantText(next), nil
+		return buildResponse(before, next), nil
 	}
 
 	return fn, sess, nil
 }
 
-func lastAssistantText(messages []provider.Message) string {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role != "assistant" {
-			continue
-		}
-		var parts []string
-		for _, b := range messages[i].Content {
-			if b.Type == "text" && b.Text != "" {
-				parts = append(parts, b.Text)
+// buildResponse formats the agent's turn as a readable block for code.mimi.
+// It shows each bash command and its output, then the final text response.
+func buildResponse(before, after []provider.Message) string {
+	// Map tool_use IDs → name so we can pair results with calls.
+	type call struct{ name, cmd string }
+	calls := map[string]call{}
+
+	var b strings.Builder
+
+	for _, msg := range after[len(before):] {
+		switch msg.Role {
+		case "assistant":
+			for _, blk := range msg.Content {
+				switch blk.Type {
+				case "text":
+					if t := strings.TrimSpace(blk.Text); t != "" {
+						b.WriteString(t)
+						b.WriteString("\n")
+					}
+				case "tool_use":
+					c := call{name: blk.Name}
+					if blk.Input != nil {
+						c.cmd, _ = blk.Input["cmd"].(string)
+					}
+					calls[blk.ID] = c
+					if blk.Name == "bash" && c.cmd != "" {
+						b.WriteString("\n```\n$ ")
+						b.WriteString(c.cmd)
+						b.WriteString("\n")
+					}
+				}
+			}
+		case "user":
+			for _, blk := range msg.Content {
+				if blk.Type != "tool_result" {
+					continue
+				}
+				c := calls[blk.ToolUseID]
+				if c.name != "bash" {
+					continue
+				}
+				content := strings.TrimRight(blk.Content, "\n")
+				if blk.IsError {
+					b.WriteString(content)
+					b.WriteString("\n[non-zero exit]\n```\n\n")
+				} else {
+					b.WriteString(content)
+					b.WriteString("\n```\n\n")
+				}
 			}
 		}
-		if len(parts) > 0 {
-			return strings.Join(parts, "\n")
-		}
 	}
-	return ""
+
+	return strings.TrimSpace(b.String())
 }

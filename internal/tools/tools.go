@@ -107,7 +107,19 @@ func tailTruncate(b []byte) (string, bool) {
 
 // ── Bash ─────────────────────────────────────────────────────────────────────
 
-// Bash executes cmd inside /bin/sh with the given working directory.
+// shell returns the shell binary and flag appropriate for the OS.
+func shell() (string, string) {
+	if sh, err := exec.LookPath("bash"); err == nil {
+		return sh, "-c"
+	}
+	// Windows fallback: try PowerShell then cmd.
+	if ps, err := exec.LookPath("powershell"); err == nil {
+		return ps, "-Command"
+	}
+	return "cmd", "/C"
+}
+
+// Bash executes cmd in a shell with the given working directory.
 // timeout is in seconds; 0 means no timeout.
 func Bash(ctx context.Context, cwd, cmd string, timeout float64) ToolResult {
 	for _, rule := range bashVetRules {
@@ -122,7 +134,8 @@ func Bash(ctx context.Context, cwd, cmd string, timeout float64) ToolResult {
 		defer cancel()
 	}
 
-	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
+	sh, flag := shell()
+	c := exec.CommandContext(ctx, sh, flag, cmd)
 	c.Dir = cwd
 	raw, err := c.CombinedOutput()
 
