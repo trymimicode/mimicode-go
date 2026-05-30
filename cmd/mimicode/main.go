@@ -24,6 +24,7 @@ import (
 	reflectpkg "github.com/trymimicode/mimicode-go/internal/reflect"
 	"github.com/trymimicode/mimicode-go/internal/repomap"
 	"github.com/trymimicode/mimicode-go/internal/store"
+	"github.com/trymimicode/mimicode-go/internal/watch"
 )
 
 var (
@@ -103,14 +104,6 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 	if err := startupChecks(errOut); err != nil {
 		return 1
 	}
-	if useTUI {
-		if err := runTUIApp(sessionID); err != nil {
-			fmt.Fprintf(errOut, "mimicode: tui: %v\n", err)
-			return 1
-		}
-		return 0
-	}
-
 	cwd, err := getwd()
 	if err != nil {
 		fmt.Fprintf(errOut, "mimicode: get cwd: %v\n", err)
@@ -119,8 +112,21 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 
 	confirm = confirm || getenv("MIMICODE_CONFIRM") == "1"
 	prompt := strings.Join(fs.Args(), " ")
+
+	// One-shot: don't start the background watcher (process exits right after).
 	if prompt != "" {
 		return runOneShot(ctx, sessionID, cwd, prompt, in, out, errOut, confirm)
+	}
+
+	// TUI / REPL: start the code.mimi background watcher so it's always live.
+	go watch.RunBackground(ctx, cwd)
+
+	if useTUI {
+		if err := runTUIApp(sessionID); err != nil {
+			fmt.Fprintf(errOut, "mimicode: tui: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 	return runREPL(ctx, sessionID, cwd, in, out, errOut, confirm)
 }
