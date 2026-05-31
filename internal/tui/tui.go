@@ -1164,21 +1164,6 @@ func renderMessages(messages []provider.Message) []line {
 	return lines
 }
 
-func formatInput(input map[string]any) string {
-	if path, ok := input["path"].(string); ok && path != "" {
-		return path
-	}
-	return fmt.Sprintf("%v", input)
-}
-
-func truncateLines(s string, n int) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
-	if len(lines) <= n {
-		return strings.Join(lines, "\n")
-	}
-	return strings.Join(lines[:n], "\n") + "\n... (full output in session log)"
-}
-
 func tick() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
@@ -1206,13 +1191,6 @@ func shortModel(model string) string {
 func estimateCost(u provider.Usage) float64 {
 	// Rough blended display-only estimate until model-specific accounting lands.
 	return float64(u.InputTokens+u.OutputTokens) / 1_000_000 * 3.0
-}
-
-func viewHeight(height int) int {
-	if height <= 3 {
-		return 10
-	}
-	return height - 3
 }
 
 // chatRows returns the number of rows available for chat content in chat mode.
