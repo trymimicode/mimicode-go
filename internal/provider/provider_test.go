@@ -121,6 +121,7 @@ func testInput() ([]Message, []ToolSchema) {
 
 func TestCallClaude(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "test-key-sync")
+	t.Setenv("MIMICODE_THINKING", "off") // baseline request shape
 
 	var (
 		gotHeaders http.Header
@@ -145,10 +146,10 @@ func TestCallClaude(t *testing.T) {
 				},
 			},
 			"usage": map[string]any{
-				"input_tokens":                   25,
-				"output_tokens":                  10,
-				"cache_creation_input_tokens":    100,
-				"cache_read_input_tokens":        50,
+				"input_tokens":                25,
+				"output_tokens":               10,
+				"cache_creation_input_tokens": 100,
+				"cache_read_input_tokens":     50,
 			},
 		})
 	}))
@@ -166,19 +167,28 @@ func TestCallClaude(t *testing.T) {
 		{"x-api-key", "test-key-sync"},
 		{"anthropic-version", "2023-06-01"},
 		{"content-type", "application/json"},
-		{"anthropic-beta", "prompt-caching-2024-07-31"},
 	} {
 		if got := gotHeaders.Get(tc.key); got != tc.want {
 			t.Errorf("header %q: got %q, want %q", tc.key, got, tc.want)
 		}
 	}
+	// Prompt caching is GA: no beta header with thinking off.
+	if got := gotHeaders.Get("anthropic-beta"); got != "" {
+		t.Errorf("anthropic-beta: got %q, want empty", got)
+	}
 
 	// ── Caching markers ───────────────────────────────────────────────────────
 	verifyCaching(t, gotBody)
 
-	// ── max_tokens propagated ────────────────────────────────────────────────
-	if mt, _ := gotBody["max_tokens"].(float64); int(mt) != maxTokens {
-		t.Errorf("max_tokens: got %v, want %d", gotBody["max_tokens"], maxTokens)
+	// ── max_tokens + temperature (thinking off) ──────────────────────────────
+	if mt, _ := gotBody["max_tokens"].(float64); int(mt) != maxTokensBase {
+		t.Errorf("max_tokens: got %v, want %d", gotBody["max_tokens"], maxTokensBase)
+	}
+	if temp, ok := gotBody["temperature"].(float64); !ok || temp != codingTemperature {
+		t.Errorf("temperature: got %v (ok=%v), want %v", gotBody["temperature"], ok, codingTemperature)
+	}
+	if _, ok := gotBody["thinking"]; ok {
+		t.Errorf("thinking should be absent when disabled, got %v", gotBody["thinking"])
 	}
 
 	// ── Response parsing ──────────────────────────────────────────────────────
@@ -222,6 +232,7 @@ func sseEvent(obj any) string {
 
 func TestCallClaudeStreaming(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "test-key-stream")
+	t.Setenv("MIMICODE_THINKING", "off") // baseline request shape
 
 	var (
 		gotHeaders http.Header
@@ -236,10 +247,10 @@ func TestCallClaudeStreaming(t *testing.T) {
 			"message": map[string]any{
 				"role": "assistant", "content": []any{},
 				"usage": map[string]any{
-					"input_tokens":                   20,
-					"output_tokens":                  0,
-					"cache_creation_input_tokens":    80,
-					"cache_read_input_tokens":        40,
+					"input_tokens":                20,
+					"output_tokens":               0,
+					"cache_creation_input_tokens": 80,
+					"cache_read_input_tokens":     40,
 				},
 			},
 		},
@@ -258,8 +269,8 @@ func TestCallClaudeStreaming(t *testing.T) {
 			"delta": map[string]any{"type": "input_json_delta", "partial_json": `"val"}`}},
 		map[string]any{"type": "content_block_stop", "index": 1},
 		map[string]any{"type": "message_delta",
-			"delta":  map[string]any{"stop_reason": "tool_use"},
-			"usage":  map[string]any{"output_tokens": 18}},
+			"delta": map[string]any{"stop_reason": "tool_use"},
+			"usage": map[string]any{"output_tokens": 18}},
 		map[string]any{"type": "message_stop"},
 	} {
 		sb.WriteString(sseEvent(evt))
@@ -298,7 +309,6 @@ func TestCallClaudeStreaming(t *testing.T) {
 		{"x-api-key", "test-key-stream"},
 		{"anthropic-version", "2023-06-01"},
 		{"content-type", "application/json"},
-		{"anthropic-beta", "prompt-caching-2024-07-31"},
 	} {
 		if got := gotHeaders.Get(tc.key); got != tc.want {
 			t.Errorf("header %q: got %q, want %q", tc.key, got, tc.want)
@@ -373,5 +383,83 @@ func TestCallClaudeStreaming(t *testing.T) {
 				t.Errorf("TextDelta with empty text")
 			}
 		}
+	}
+}
+
+// ── TestThinkingEnabled ───────────────────────────────────────────────────────
+
+// When MIMICODE_THINKING is on, the request must carry a thinking block, the
+// interleaved-thinking beta header, a budget-sized max_tokens, and no temperature.
+func TestThinkingEnabled(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "test-key-think")
+	t.Setenv("MIMICODE_THINKING", "medium")
+
+	var (
+		gotHeaders http.Header
+		gotBody    map[string]any
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "thinking", "thinking": "let me plan", "signature": "sig-abc"},
+				map[string]any{"type": "text", "text": "done"},
+			},
+			"usage": map[string]any{"input_tokens": 5, "output_tokens": 3},
+		})
+	}))
+	defer ts.Close()
+	overrideBase(t, ts)
+
+	messages, tools := testInput()
+	msg, _, err := CallClaude(context.Background(), messages, "sys", tools, "claude-sonnet-4-6")
+	if err != nil {
+		t.Fatalf("CallClaude: %v", err)
+	}
+
+	// thinking block present and budget-shaped.
+	think, ok := gotBody["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("thinking block missing: %v", gotBody["thinking"])
+	}
+	if think["type"] != "enabled" {
+		t.Errorf("thinking.type = %v, want enabled", think["type"])
+	}
+	budget, _ := think["budget_tokens"].(float64)
+	if mt, _ := gotBody["max_tokens"].(float64); int(mt) != int(budget)+maxTokensBase {
+		t.Errorf("max_tokens = %v, want budget(%v)+%d", gotBody["max_tokens"], budget, maxTokensBase)
+	}
+	if _, ok := gotBody["temperature"]; ok {
+		t.Errorf("temperature must be unset with thinking on, got %v", gotBody["temperature"])
+	}
+	if got := gotHeaders.Get("anthropic-beta"); got != "interleaved-thinking-2025-05-14" {
+		t.Errorf("anthropic-beta = %q, want interleaved-thinking-2025-05-14", got)
+	}
+
+	// The thinking block (with signature) must survive parsing for round-tripping.
+	if len(msg.Content) != 2 || msg.Content[0].Type != "thinking" {
+		t.Fatalf("expected leading thinking block, got %+v", msg.Content)
+	}
+	if msg.Content[0].Thinking != "let me plan" || msg.Content[0].Signature != "sig-abc" {
+		t.Errorf("thinking round-trip lost data: %+v", msg.Content[0])
+	}
+
+	// A preserved thinking block must serialize back out with its signature.
+	rb := buildRequest([]Message{{Role: "assistant", Content: msg.Content}}, "", nil, "m", false)
+	var blocks []map[string]any
+	if err := json.Unmarshal(rb.Messages[0].Content, &blocks); err != nil {
+		t.Fatalf("unmarshal echoed blocks: %v", err)
+	}
+	if blocks[0]["type"] != "thinking" || blocks[0]["signature"] != "sig-abc" {
+		t.Errorf("thinking block not serialized back: %+v", blocks[0])
+	}
+	// cache_control must never land on a thinking block.
+	if _, ok := blocks[0]["cache_control"]; ok {
+		t.Errorf("cache_control wrongly placed on thinking block")
 	}
 }
