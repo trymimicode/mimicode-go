@@ -109,8 +109,10 @@ type fakeBriefer struct {
 
 func (f *fakeBriefer) brief(_ context.Context, _, delta string) (string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.deltas = append(f.deltas, delta)
+	f.mu.Unlock()
+	// Note: answer is invoked WITHOUT the lock held so a slow/blocking answer
+	// (used to simulate "mimi is thinking") doesn't stall seen() in the test.
 	if f.answer != nil {
 		return f.answer(delta), nil
 	}
@@ -234,18 +236,24 @@ func TestRunMidFileInsert(t *testing.T) {
 	_, path, cancel := startWatch(t, fb)
 	defer cancel()
 
-	if err := os.WriteFile(path, []byte("line a\nline c\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	appendToFile(t, path, "line a\nline c\n")
+	// Wait for the first turn to fully land (answer written to the file), so the
+	// snapshot is settled before we edit in place.
 	waitFor(t, "initial answered", func() bool {
-		seen := fb.seen()
-		return len(seen) >= 1
+		return strings.Contains(readFile(t, path), "ANSWER:line a")
 	})
 
-	// Insert a line between the two existing ones.
-	if err := os.WriteFile(path, []byte("line a\nline b inserted\nline c\nANSWER:line a\nline c\n"), 0o644); err != nil {
+	// Edit the real file in place: insert a line between "line a" and "line c",
+	// leaving mimi's existing answer untouched.
+	cur := readFile(t, path)
+	edited := strings.Replace(cur, "line a\nline c", "line a\nline b inserted\nline c", 1)
+	if edited == cur {
+		t.Fatalf("failed to construct mid-file insert from: %q", cur)
+	}
+	if err := os.WriteFile(path, []byte(edited), 0o644); err != nil {
 		t.Fatal(err)
 	}
+
 	waitFor(t, "inserted line answered", func() bool {
 		for _, d := range fb.seen() {
 			if strings.Contains(d, "line b inserted") {
