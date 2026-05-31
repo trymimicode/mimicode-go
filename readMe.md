@@ -1,25 +1,16 @@
 # mimicode
 
-A quiet coding agent for engineers who want to stay sharp.
+A coding agent that lives in your editor as a text file.
+
+No chat window. No tab switching. No separate tool to learn. Open `code.mimi` in your IDE, write a question, save — the answer lands below a divider in the same file. Stay in your flow.
 
 mimi handles the rote work — searching your codebase, reading docs, running builds, making mechanical edits — so you can spend your energy on the parts that actually require a brain.
 
 It is not a pair programmer. It does not make decisions for you. It is a tool, in the Unix sense.
 
-PS: this is still very beta and we know its not there yet, so be patient also feedbacks are heavily appreciated.
+> still beta. feedback appreciated.
 
 ---
-
-## reccomended workflow
-this tool is built to be used anywhere efficently, at the end of the day its just a text file that lives in your project folder here is why:
-- you can get back to coding with no disctraction(no cli, no chat section nothing).
-- a clean append only text file with proper turn formatting so that you cant focus on thinking out loud-  
-and this tools just works based on that.
-- why a text file? i want this tool to improve your writting habits and building problem solving ablility by actually thinking about-
-problems instead of just offloading it to ai.
-
-so just start the watcher and ask question and try implementing and learning on your own, we expect you to move on from this tool-
-once you regain mental clarity to solve problems on your own.
 
 ## install
 
