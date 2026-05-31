@@ -75,9 +75,8 @@ func main() {
 }
 
 func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer) int {
-	applyStoredKey()
-
 	if len(args) > 0 && args[0] == "watch" {
+		applyStoredKey()
 		return runWatch(ctx, args[1:], out, errOut)
 	}
 	if len(args) > 0 && args[0] == "key" {
@@ -107,6 +106,10 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 		fmt.Fprintf(out, "  go:     %s\n", runtime.Version())
 		return 0
 	}
+
+	// Load the stored API key only for paths that actually call the API; --version
+	// must not touch the environment or config.
+	applyStoredKey()
 
 	if err := startupChecks(errOut); err != nil {
 		return 1
