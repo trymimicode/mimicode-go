@@ -234,6 +234,7 @@ The loop adapts to your codebase and your workflow over time.
 |---|---|---|
 | `ANTHROPIC_API_KEY` | required | Anthropic API key |
 | `MIMICODE_MODEL` | Sonnet | model id to use for every turn |
+| `MIMICODE_THINKING` | `medium` | extended-thinking budget: `off` / `low` / `medium` / `high` |
 | `MIMICODE_CONFIRM` | `0` | set `1` to ask before each bash/write/edit (same as `--confirm`) |
 | `MIMICODE_CHECKPOINT` | `1` | set `0` to disable turn checkpoints / `:undo` |
 | `MIMICODE_MAX_STEPS` | `25` | max tool calls per turn |
