@@ -93,7 +93,7 @@ var (
 var TOOLS = []provider.ToolSchema{
 	{
 		Name:        "bash",
-		Description: "Run a shell command in the current working directory. Use for tests, builds, searches, and other terminal tasks.",
+		Description: "Run a shell command in the current working directory and return combined stdout/stderr plus exit status. Use it for builds, tests, linters, git, and 'rg' searches. A non-zero exit is reported, not hidden. Output is capped at ~100KB (last bytes kept); narrow the command if you hit the cap. Prefer one targeted command over a broad one.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -130,7 +130,7 @@ var TOOLS = []provider.ToolSchema{
 	},
 	{
 		Name:        "edit",
-		Description: "Apply exact find-and-replace edits to an existing text file.",
+		Description: "Edit an existing file by exact text replacement. Each old_text must match exactly once in the current file — include just enough surrounding context to be unique, and no more (do not pad with large unchanged regions). To change several places in the same file, pass multiple entries in 'edits'; they are matched against the original file and applied atomically (all-or-nothing) and must not overlap. Read the file before editing. For new files or a full rewrite, use 'write' instead.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -636,7 +636,15 @@ func numberInput(input map[string]any, key string) float64 {
 func editInputs(input map[string]any) []tools.EditOp {
 	raw, ok := input["edits"].([]any)
 	if !ok {
-		return nil
+		// Some models (e.g. Opus 4.x, GLM) emit `edits` as a JSON-encoded string
+		// instead of an array. Decode it rather than silently dropping the edits.
+		if s, isStr := input["edits"].(string); isStr && strings.TrimSpace(s) != "" {
+			if err := json.Unmarshal([]byte(s), &raw); err != nil {
+				return nil
+			}
+		} else {
+			return nil
+		}
 	}
 	edits := make([]tools.EditOp, 0, len(raw))
 	for _, item := range raw {
