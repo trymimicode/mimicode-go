@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -246,6 +247,10 @@ func BuildSystem(cwd string) string {
 	fmt.Fprintf(&b, "\n\nCurrent date: %s", time.Now().Format("2006-01-02"))
 	fmt.Fprintf(&b, "\nCurrent working directory: %s", cwd)
 
+	if path, content := loadProjectContext(cwd); content != "" {
+		fmt.Fprintf(&b, "\n\n## Project instructions (%s)\n"+
+			"These are the project's own conventions. Follow them.\n\n%s", path, content)
+	}
 	if repo := repomap.Cached(); repo != "" {
 		fmt.Fprintf(&b, "\n\n## Repository map\n%s", repo)
 	}
@@ -256,6 +261,33 @@ func BuildSystem(cwd string) string {
 		fmt.Fprintf(&b, "\n\n## Memory\n%s", mem)
 	}
 	return b.String()
+}
+
+// projectContextFiles are the conventional names projects use to instruct coding
+// agents, in priority order. The first one found wins.
+var projectContextFiles = []string{"AGENTS.md", "CLAUDE.md", ".mimi/AGENTS.md"}
+
+// loadProjectContext returns the path and contents of the project's own
+// agent-instructions file (AGENTS.md / CLAUDE.md), if present. Oversized files
+// are truncated so a stray doc can't blow the context budget.
+func loadProjectContext(cwd string) (string, string) {
+	const maxBytes = 32 * 1024
+	for _, name := range projectContextFiles {
+		path := filepath.Join(cwd, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		content := strings.TrimSpace(string(data))
+		if content == "" {
+			continue
+		}
+		if len(content) > maxBytes {
+			content = content[:maxBytes] + "\n…(truncated)"
+		}
+		return name, content
+	}
+	return "", ""
 }
 
 func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []provider.Message) ([]provider.Message, error) {
