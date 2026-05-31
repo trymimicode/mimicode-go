@@ -54,3 +54,23 @@ Pushed.
 ──────────────────────────── your turn ────────────────────────────
 
 do a commit and push again 
+
+─────────────────────────────── mimi ───────────────────────────────
+
+⋯ $ cd /Users/l3mon/Documents/mimicode-go && git status · $ cd /Users/l3mon/Documents/mimicode-go && git add -A && git commit -m "u…
+
+Done.
+
+──────────────────────────── your turn ────────────────────────────
+lets rewrite the usage section and down below to match our watcher file mechanism that nobody has right? keep it clean 
+─────────────────────────────── mimi ───────────────────────────────
+
+⋯ read readMe.md · read watch.go · read notebook.go · read agent_brief.go · read code.mimi · edit readMe.md · read readMe.md
+
+Got the full picture. Writing now.
+
+Clean. Commit and push?
+
+──────────────────────────── your turn ────────────────────────────
+
+do a git add -u and git commit and then push 

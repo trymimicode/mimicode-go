@@ -6,6 +6,8 @@ mimi handles the rote work — searching your codebase, reading docs, running bu
 
 It is not a pair programmer. It does not make decisions for you. It is a tool, in the Unix sense.
 
+PS: this is still very beta and we know its not there yet, so be patient also feedbacks are heavily appreciated.
+
 ---
 
 ## reccomended workflow
@@ -38,11 +40,33 @@ go install github.com/trymimicode/mimicode-go/cmd/mimicode@latest
 ## use
 
 ```sh
-mimicode "why is this segfaulting"
-mimicode "add a --dry-run flag"
-mimicode --tui                     # terminal UI with streaming
-mimicode -s myfeature "continue"   # named, resumable session
+mimicode watch      # start the watcher in your project folder
 ```
+
+a file called `code.mimi` appears. open it in your editor.
+write something. save. mimi's answer lands below a divider — in the same file.
+
+```
+● mimicode is tracking this file
+  Write your message below, then save.
+
+why does this handler fire twice on the first request?
+
+──────────────────────────── mimi ──────────────────────────────
+
+⋯ read server.go · $ grep -n "HandleFunc" server.go
+
+the middleware is registered twice — once in NewRouter and again
+in main. the second registration wraps the first, so both fire.
+
+────────────────────────── your turn ───────────────────────────
+```
+
+write anywhere — append, edit in place, or clear and start fresh.
+mimi diffs every save against the last snapshot, so it only ever
+reacts to what is new. its own answers are never replayed as input.
+
+stay in your editor. no switching tabs, no chat window, no cli prompt.
 
 ---
 
