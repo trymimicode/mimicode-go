@@ -1,190 +1,43 @@
 # mimicode
 
-[![CI](https://github.com/trymimicode/mimicode-go/actions/workflows/ci.yml/badge.svg)](https://github.com/trymimicode/mimicode-go/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/trymimicode/mimicode-go)](https://github.com/trymimicode/mimicode-go/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Go Version](https://img.shields.io/badge/go-1.26-blue.svg)](https://go.dev/dl/)
-[![Go Report Card](https://goreportcard.com/badge/github.com/trymimicode/mimicode-go)](https://goreportcard.com/report/github.com/trymimicode/mimicode-go)
+A quiet coding agent for engineers who want to stay sharp.
 
-A minimal coding agent for engineers who want to stay in control.
+mimi handles the rote work — searching your codebase, reading docs, running builds, making mechanical edits — so you can spend your energy on the parts that actually require a brain.
 
-mimi does one thing: offloads the rote work — grepping through codebases, looking up docs,
-running builds, making mechanical edits — so you can spend your time on the parts that
-actually require a brain. It is not a pair programmer. It does not make decisions for you.
-It is a tool, in the Unix sense.
-
-Everything it does is logged. Every file it touches, every command it runs, every API call
-it makes — written to a `.mimi/<session>.jsonl` file you can read, replay, or audit.
-Memory is flat markdown in `.mimi/MEMORY.md`. No black boxes.
+It is not a pair programmer. It does not make decisions for you. It is a tool, in the Unix sense.
 
 ---
 
-## Quick Start
+## install
 
-```sh
-# Install (requires Go 1.26+ and ripgrep)
-curl -fsSL https://raw.githubusercontent.com/trymimicode/mimicode-go/main/install.sh | bash
-
-# Set your API key
-export ANTHROPIC_API_KEY="your-key-here"
-
-# Run
-mimicode "add tests to calc.go"
-mimicode --tui  # terminal UI with streaming
-```
-
----
-
-## requirements
-
-- [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) — mimi uses it for all searches
-- `ANTHROPIC_API_KEY` — Haiku and Sonnet via the Anthropic API
-
----
-
-## installation
-
-**Quick install** (requires Go 1.26+):
 ```sh
 curl -fsSL https://raw.githubusercontent.com/trymimicode/mimicode-go/main/install.sh | bash
 ```
 
-**Or install via Go**:
+or via Go:
+
 ```sh
 go install github.com/trymimicode/mimicode-go/cmd/mimicode@latest
 ```
 
-**Or build from source**:
-```sh
-git clone https://github.com/trymimicode/mimicode-go.git
-cd mimicode-go
-make install
-```
-
-**Set your API key**:
-```sh
-export ANTHROPIC_API_KEY="your-key-here"
-# Add to ~/.zshrc or ~/.bashrc to persist
-```
+**requirements:** [ripgrep](https://github.com/BurntSushi/ripgrep) and an `ANTHROPIC_API_KEY`.
 
 ---
 
-## development
+## use
 
-```sh
-make build       # → ./mimicode
-make install     # → $GOPATH/bin/mimicode
-make test        # run all tests
-make fmt         # format code
-make vet         # run go vet
-make dev         # build and run in TUI mode
-make help        # show all targets
-```
-
----
-
-## usage
-
-**one-shot** — pipe in a task, get output, back to your shell:
 ```sh
 mimicode "why is this segfaulting"
-mimicode "add a --dry-run flag to the CLI"
-mimicode -s myfeature "continue from where we left off"
+mimicode "add a --dry-run flag"
+mimicode --tui                     # terminal UI with streaming
+mimicode -s myfeature "continue"   # named, resumable session
 ```
-
-**REPL** — drop into a session:
-```sh
-mimicode
-mimicode -s myfeature
-```
-
-**TUI** — Bubbletea interface with streaming output and markdown rendering:
-```sh
-mimicode --tui
-mimicode --tui -s myfeature
-```
-
-Sessions are resumable. `-s <name>` names a session; omit it for an anonymous one.
-Conversation history is saved under `~/.mimi/sessions/<id>/`.
 
 ---
 
-## checkpoints & undo
+## how it works
 
-Every turn that changes files is snapshotted into a shadow git repo (in the
-session dir, work-tree pointed at your project). Your real `.git` is never
-touched — no stray commits, no dirtied history.
-
-```
-> Add a Sub function to calc.go.
-checkpoint eb33e84 — turn 1: Add a Sub function to calc.go.
-
-> :undo            # revert the last turn
-reverted to: session start
-
-> :undo 3          # revert the last 3 turns
-> :undo list       # show all checkpoints this session
-```
-
-`:undo` restores the working tree; it never deletes work irrecoverably
-(reset commits stay reachable via `git reflog` in the shadow repo). Disable
-with `MIMICODE_CHECKPOINT=0`.
-
----
-
-## confirm-gate
-
-Run with `--confirm` (or `MIMICODE_CONFIRM=1`) and mimi asks before every
-side-effecting tool — `bash`, `write`, `edit`. Read-only tools (read, search,
-web, memory) never prompt.
-
-```sh
-mimicode --confirm "refactor calc.go"
-```
-```
-  mimi wants to run edit:
-    calc.go
-    - func Add(a, b int) int { return a + b }
-    + func Add(a, b int) int { return a + b }
-  allow? [y]es / [n]o:
-```
-
-Deny and mimi gets the refusal as a tool result — it won't retry the same call,
-it picks a different approach or asks you what you want. Nothing touches your
-files or shell without a `y`.
-
----
-
-## self-recovery
-
-When mimi gets stuck — repeating the same failing tool call, a run of errors,
-or burning the step budget without finishing — it stops and diagnoses itself.
-A fresh, clean model call reads the `events.jsonl` decision trace, works out
-the root cause, and proposes a fix plus a durable rule. **It asks before acting**
-— nothing is applied without your confirmation.
-
-```
-⚠ mimi got stuck.
-  what went wrong: exhausted the step budget after editing but never ran the tests.
-  recovery plan:   batch the test + vet into one command, then summarize.
-  proposed rule:   For multi-step tasks, batch independent ops into one tool call.
-  apply recovery? [y]es retry / [r]ule only / [n]o:
-```
-
-- **y** — append the rule to `.mimi/RULES.md`, checkpoint, reset to a *clean
-  context* seeded only with the task + diagnosis, and retry.
-- **r** — record the rule for next time, don't retry.
-- **n** — do nothing.
-
-It never rewrites its own code — only the markdown rules you can read and edit.
-The clean-context retry runs once; if it sticks again, mimi reports and stops
-rather than looping.
-
----
-
-## tools
-
-mimi has ten tools. That is the entire surface area.
+mimi has ten tools. that is the entire surface area.
 
 | tool | what it does |
 |---|---|
@@ -192,39 +45,82 @@ mimi has ten tools. That is the entire surface area.
 | `read` | reads a file with line numbers |
 | `write` | creates or overwrites a file |
 | `edit` | exact find-and-replace, atomic batch edits |
-| `web_search` | DuckDuckGo search, supports `site:` filters |
-| `web_fetch` | fetches a URL; handles GitHub issues, Reddit, HN, SO natively |
-| `stackoverflow_search` | searches SO and returns questions + top answers inline |
+| `web_search` | DuckDuckGo, supports `site:` filters |
+| `web_fetch` | fetches a URL; handles GitHub, Reddit, HN, SO natively |
+| `stackoverflow_search` | SO questions + top answers inline |
 | `memory_write` | appends a note to `.mimi/MEMORY.md` |
-| `memory_search` | FTS5 search across sessions, memory, and rules |
-| `recall_compaction` | loads a prior compaction summary |
-
-mimi defaults to Sonnet. You pick the model — set `MIMICODE_MODEL` to override
-(e.g. the cheaper Haiku). No hidden routing: the engineer decides, not a regex.
+| `memory_search` | full-text search across sessions, memory, and rules |
+| `recall_compaction` | loads a prior session summary |
 
 ---
 
-## audit trail
+## nothing is hidden
+
+every file touched, every command run, every API call — written to a `.mimi/<session>.jsonl` file you can read, replay, or audit. memory lives in flat markdown. no black boxes.
 
 ```
 ~/.mimi/sessions/<id>/
-  events.jsonl        # every decision: model text, tool calls, tokens, ms
-  messages.json       # full conversation for resume
-  checkpoints.git/    # shadow repo backing :undo
-  compactions.jsonl   # compaction summaries
+  events.jsonl      # every decision: model text, tool calls, tokens, timing
+  messages.json     # full conversation for resume
 
 <project>/.mimi/
-  MEMORY.md           # cross-session notes (readable markdown)
-  RULES.md            # behavioral rules learned from past sessions
+  MEMORY.md         # cross-session notes
+  RULES.md          # behavioral rules learned from past sessions
 ```
 
-The `events.jsonl` trace is the point: each step records the model's own text,
-the tool calls it made with full inputs, the token split (in/out/cache), and
-timing. You can replay exactly how mimi decided — nothing is hidden.
+---
 
-After each session, mimi runs a Haiku call to summarize what happened and appends
-it to `MEMORY.md`. That summary is injected into the system prompt next time.
-The loop adapts to your codebase and your workflow over time.
+## undo
+
+every turn that changes files is snapshotted. your real `.git` is never touched.
+
+```sh
+> :undo            # revert the last turn
+> :undo 3          # revert the last 3 turns
+> :undo list       # show all checkpoints
+```
+
+disable with `MIMICODE_CHECKPOINT=0`.
+
+---
+
+## confirm mode
+
+run with `--confirm` and mimi asks before every write, edit, or shell command. read-only tools never prompt.
+
+```sh
+mimicode --confirm "refactor calc.go"
+```
+
+---
+
+## when it gets stuck
+
+if mimi repeats itself, burns the step budget, or hits a run of errors — it stops, reads its own trace, and explains what went wrong. it proposes a fix and asks before doing anything. it never retries silently.
+
+---
+
+## codebase
+
+44 Go files across 13 packages. readable in one sitting.
+
+```
+cmd/mimicode/        — entry points (watch, tui, key)
+internal/
+  agent/             — turn loop, tool dispatch, stuck detection
+  provider/          — Anthropic API calls, streaming
+  tools/             — bash, read, write, edit, web, git
+  tui/               — bubbletea terminal UI
+  watch/             — notebook/file watcher mode
+  store/             — session persistence (sqlite)
+  memory/            — cross-session memory and FTS search
+  reflect/           — post-session summarization
+  recovery/          — stuck diagnosis
+  checkpoint/        — shadow git for undo
+  compactor/         — long-session compaction
+  repomap/           — symbol index
+  gitsource/         — git clone for library inspection
+```
 
 ---
 
@@ -233,20 +129,29 @@ The loop adapts to your codebase and your workflow over time.
 | env var | default | description |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | required | Anthropic API key |
-| `MIMICODE_MODEL` | Sonnet | model id to use for every turn |
-| `MIMICODE_THINKING` | `medium` | extended-thinking budget: `off` / `low` / `medium` / `high` |
-| `MIMICODE_CONFIRM` | `0` | set `1` to ask before each bash/write/edit (same as `--confirm`) |
-| `MIMICODE_CHECKPOINT` | `1` | set `0` to disable turn checkpoints / `:undo` |
+| `MIMICODE_MODEL` | claude-opus-4 | model to use |
+| `MIMICODE_THINKING` | `medium` | thinking budget: `off` / `low` / `medium` / `high` |
+| `MIMICODE_CONFIRM` | `0` | `1` to confirm before each write/edit/bash |
+| `MIMICODE_CHECKPOINT` | `1` | `0` to disable undo |
 | `MIMICODE_MAX_STEPS` | `25` | max tool calls per turn |
-| `MIMICODE_COMPACT_AUTO` | `true` | auto-compact long sessions |
-| `MIMICODE_COMPACT_TURN_INTERVAL` | `5` | turns between compaction checks |
-| `MIMICODE_COMPACT_TOKEN_THRESHOLD` | `20000` | token count that triggers compaction |
-| `STACK_EXCHANGE_KEY` | optional | raises SO API quota from 300 to 10k req/day |
 
 ---
 
-## origin
+## build from source
 
-Started as a Python prototype at [mimicode](../mimicode). This is the Go port —
-same architecture, same philosophy, statically compiled, no runtime dependencies
-beyond `rg` and an API key.
+```sh
+git clone https://github.com/trymimicode/mimicode-go.git
+cd mimicode-go
+make install
+```
+
+```sh
+make build    # → ./mimicode
+make test     # run all tests
+make fmt      # format
+make vet      # vet
+```
+
+---
+
+MIT license.

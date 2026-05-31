@@ -8,7 +8,44 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/trymimicode/mimicode-go/internal/provider"
 )
+
+func textMsg(role, text string) provider.Message {
+	return provider.Message{Role: role, Content: []provider.ContentBlock{{Type: "text", Text: text}}}
+}
+
+// TestTurnMessagesSurvivesCompaction guards the crash where auto-compaction
+// shrinks the message slice: slicing by the prior length panicked. turnMessages
+// must locate the prompt from the end and return only this turn's output.
+func TestTurnMessagesSurvivesCompaction(t *testing.T) {
+	// Compaction replaced earlier turns with a single summary, so the slice is
+	// short and the prompt sits near the end.
+	msgs := []provider.Message{
+		textMsg("user", "[summary of earlier conversation]"),
+		textMsg("user", "the new question"),
+		textMsg("assistant", "the answer"),
+	}
+	got := turnMessages(msgs, "  the new question  ")
+	if len(got) != 1 || got[0].Role != "assistant" || got[0].Content[0].Text != "the answer" {
+		t.Fatalf("turnMessages = %+v, want just the assistant answer", got)
+	}
+	// buildResponse must render it without panicking.
+	if out := buildResponse(got); !strings.Contains(out, "the answer") {
+		t.Fatalf("buildResponse = %q, want it to contain the answer", out)
+	}
+}
+
+// TestTurnMessagesFallsBackWhenPromptMissing returns the whole slice rather than
+// panicking when the prompt can't be found (e.g. it was itself compacted away).
+func TestTurnMessagesFallsBackWhenPromptMissing(t *testing.T) {
+	msgs := []provider.Message{textMsg("assistant", "orphaned answer")}
+	got := turnMessages(msgs, "a prompt no longer present")
+	if len(got) != 1 || got[0].Content[0].Text != "orphaned answer" {
+		t.Fatalf("turnMessages fallback = %+v, want the full slice", got)
+	}
+}
 
 func TestEnsureNotebookCreatesOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "code.mimi")
