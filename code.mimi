@@ -43,3 +43,14 @@ Commit just the README, or everything?
 ──────────────────────────── your turn ────────────────────────────
 
 everything
+─────────────────────────────── mimi ───────────────────────────────
+
+⋯ $ cd /Users/l3mon/Documents/mimicode-go && git add -A && git commit -m "r… · $ cd /Users/l3mon/Documents/mimicode-go && git pull --rebase && git push
+
+Remote has new commits. Pulling first.
+
+Pushed.
+
+──────────────────────────── your turn ────────────────────────────
+
+do a commit and push again 

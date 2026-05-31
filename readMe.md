@@ -8,6 +8,17 @@ It is not a pair programmer. It does not make decisions for you. It is a tool, i
 
 ---
 
+## reccomended workflow
+this tool is built to be used anywhere efficently, at the end of the day its just a text file that lives in your project folder here is why:
+- you can get back to coding with no disctraction(no cli, no chat section nothing).
+- a clean append only text file with proper turn formatting so that you cant focus on thinking out loud-  
+and this tools just works based on that.
+- why a text file? i want this tool to improve your writting habits and building problem solving ablility by actually thinking about-
+problems instead of just offloading it to ai.
+
+so just start the watcher and ask question and try implementing and learning on your own, we expect you to move on from this tool-
+once you regain mental clarity to solve problems on your own.
+
 ## install
 
 ```sh
