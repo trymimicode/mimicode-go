@@ -187,10 +187,15 @@ func startWatch(t *testing.T, fb *fakeBriefer) (dir, path string, cancel context
 			Brief: fb.brief,
 		})
 	}()
-	// The header is stamped and anchored on startup.
+	// The header is stamped and the snapshot anchored on startup.
+	// Wait for both so appendToFile in tests never races writeSnapshot.
 	waitFor(t, "notebook created with header", func() bool {
 		data, err := os.ReadFile(path)
-		return err == nil && strings.Contains(string(data), "tracking")
+		if err != nil || !strings.Contains(string(data), "tracking") {
+			return false
+		}
+		_, snapErr := os.Stat(filepath.Join(dir, ".mimi", "watch.snapshot"))
+		return snapErr == nil
 	})
 	return dir, path, cancel
 }
