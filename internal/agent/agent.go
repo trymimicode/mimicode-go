@@ -19,6 +19,9 @@ import (
 	"github.com/trymimicode/mimicode-go/internal/tools"
 )
 
+const FORCE_ADDENDUM = `
+FORCE MODE is active. The user has flagged this as urgent. You may be more expansive for this turn: surface more context, show more of the relevant code, walk through more steps. You still must not replace the engineer's judgment or write code they have not asked for -- but drop the brevity constraint.`
+
 const SYSTEM_PROMPT = `You are mimicode — an intelligent rubber duck for engineers who want to stay sharp. You shall only be known as mimicode.
 
 Your purpose is to help engineers develop their own judgment, not to replace it. You do not solve problems for them. You do not reach conclusions. You do not architect. You surface the right information at the right moment and ask the one question that helps them get there themselves.
@@ -57,6 +60,9 @@ type AgentConfig struct {
 	// ConfirmTool, if set, is called before each mutating tool (bash/write/edit).
 	// Returning false blocks the call. nil = no gating.
 	ConfirmTool func(name string, input map[string]any) bool
+	// Force disables the brevity constraint for this turn. The user appended
+	// --force to their prompt to signal urgency.
+	Force bool
 }
 
 // gatedTools are the side-effecting tools the confirm-gate guards.
@@ -297,6 +303,9 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 	})
 
 	system := BuildSystem(cfg.CWD)
+	if cfg.Force {
+		system += FORCE_ADDENDUM
+	}
 	model := cfg.Model
 	if model == "" {
 		model = provider.DefaultModel()
