@@ -173,6 +173,10 @@ func runOneShot(ctx context.Context, sessionID, cwd, prompt string, in io.Reader
 	if confirm {
 		cfg.ConfirmTool = makeConfirmTool(bufio.NewReader(in), errOut)
 	}
+	if strings.HasSuffix(prompt, "--force") {
+		prompt = strings.TrimSpace(strings.TrimSuffix(prompt, "--force"))
+		cfg.Force = true
+	}
 	var err error
 	messages, err = agentTurn(ctx, cfg, prompt, messages)
 	if stuck, ok := agent.IsStuck(err); ok {
@@ -211,7 +215,7 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 	cfg := agent.AgentConfig{CWD: cwd, Session: sess, MaxSteps: 25}
 	cp := checkpoint.New(sess.Path(), cwd)
 	cp.Snapshot("session start")
-	fmt.Fprintln(errOut, "[mimicode] REPL. empty line or :q / ctrl-d to exit. :compact compaction, :undo [n] revert turns.")
+	fmt.Fprintln(errOut, "[mimicode] REPL. empty line or :q / ctrl-d to exit. :compact compaction, :undo [n] revert turns. Append --force to skip brevity rules.")
 
 	turn := 0
 	reader := bufio.NewReader(in)
@@ -225,6 +229,11 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 			return 1
 		}
 		prompt := strings.TrimSpace(line)
+		turnCfg := cfg
+		if strings.HasSuffix(prompt, "--force") {
+			prompt = strings.TrimSpace(strings.TrimSuffix(prompt, "--force"))
+			turnCfg.Force = true
+		}
 		if err == io.EOF && prompt == "" {
 			break
 		}
@@ -249,7 +258,7 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 		printTurnStart(errOut, sess)
 		before := append([]provider.Message(nil), messages...)
 		var turnErr error
-		messages, turnErr = agentTurn(ctx, cfg, prompt, messages)
+		messages, turnErr = agentTurn(ctx, turnCfg, prompt, messages)
 		if stuck, ok := agent.IsStuck(turnErr); ok {
 			recoveryPrompt, apply := proposeRecovery(ctx, reader, sess, cwd, cp, prompt, stuck, errOut)
 			if !apply {
