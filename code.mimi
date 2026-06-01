@@ -83,3 +83,221 @@ Honest observations from what I can actually see in the code:
 Those are things I noticed. What do *you* think is the most brittle?
 
 ──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+You pasted my response back at me. What's your actual take on any of those five?
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+⋯ read search.go · read main.go · $ cd D:\mimicode-go && rg "/search|/list|/sessions|memory\.Search|memory\… · read main.go
+
+I looked at all five. Here's what the code actually confirms:
+
+**#1 (memory/search.go orphaned)** — hardest confirmed. `memory.Search` and `memory.FormatResults` are never called from anywhere. The FTS5 index, query escaping, snippet formatting — all of it built and wired to nothing. That's not just unfinished, that's a complete feature sitting dark.
+
+**#5 (extractLastAssistantText)** — also confirmed. Line 526: it joins text blocks and returns. If the last assistant message is tool-use only, you get `""` and the caller at `reflectSession` gets an empty string with no way to distinguish "no assistant turn" from "assistant turn had no text." Silent and wrong.
+
+**#3 (no session listing)** — confirmed. `rg` found zero references to `/list`, `/sessions`, or any session enumeration in the REPL. `store.go` has the session directory structure but nothing surfaces it interactively.
+
+**#2 and #4** — real, but lower signal. The Windows bash gap is a UX paper cut. `startupChecks` being thin is cosmetic until someone hits a real misconfiguration.
+
+Between #1 and #5 — which one are you more annoyed by?
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+Looks like the UI might be echoing my text back. Type your own thought and I'll pick it up.
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+Fair.
+
+\#5 bothers me most. Silent empty return isn't just a UX gap — `reflectSession` consumes it. If reflection runs on a tool-use-heavy turn and gets `""`, you either write a blank reflection or skip it entirely. Either way the session record is quietly wrong and you'd never know. That's the kind of bug that poisons data silently over time.
+
+\#1 is interesting for a different reason. `FormatResults` has a specific output format — `[memory_search] N match(es) for: ...`. That's not internal scaffolding, that's designed for a user to read. Someone built the display layer. The missing piece isn't the hard part, which makes it stranger that it stopped there.
+
+\#3 I find less interesting than it sounds. Session listing is a convenience feature. The deeper question is whether the REPL is even the right place for it — or whether that's a symptom of the REPL trying to do too much.
+
+\#2 and \#4 I don't really care about. They're polish, not correctness.
+
+What's pulling you toward any of these specifically?
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+Still echoing. I'll wait.
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+The thing I keep coming back to is `#5` and `#1` being related. `reflectSession` writes to memory after each turn. `Search` reads from memory but is never called. So you have a write pipeline with no read path wired to the surface. The data is accumulating somewhere it can never be retrieved from during a session. That's not two separate issues — that's one broken loop.
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+Still here. What do you want to dig into?
+
+──────────────────────────── your turn ────────────────────────────
+okay, it seems like the code is going back and forth and mimi is conversing and echoing with itself even with no input from me. Find the most plausible reason on why this happens, is it because of file lock or session
+─────────────────────────────── mimi ───────────────────────────────
+
+⋯ $ rg -n "DoesNotReplay\|replayItsOwn\|ownAnswer\|seenResponse\|alreadyRes… · $ rg -n "suffix\|snapshot\|seen\|replay\|own" internal/watch/watch.go int… · $ r…
+
+That test name is a big hint. Let me look at the guard first.
+
+The anti-replay guard is at `watch.go:155`. Now let me check what `appendResponse` returns as `suffix` versus what actually lands on disk. Now check if `writeSnapshot` can fail silently. There it is. `writeSnapshot` at line 33 discards its error entirely — `_ = os.WriteFile(...)`. If that write fails for any reason (permissions, disk issue, `.mimi/` dir not created in time), the snapshot stays stale. On the next tick: file-on-disk contains mimi's appended response, snapshot does not → `extractNewContent` sees mimi's own text as new user input → another turn fires → loop.
+
+What condition on your machine could cause that `os.WriteFile` to silently fail?
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+⋯ read agent_brief.go · $ cd D:\mimicode-go && rg --files internal/watch/ · read watch.go · read notebook.go · read diff.go · read snapshot.go
+
+Found it. Look at `watch.go:147-150` and `notebook.go:70`:
+
+```
+appendResponse opens with O_WRONLY|O_APPEND — no file lock
+```
+
+If that write fails (editor holds an exclusive lock on Windows), the error branch at `watch.go:149` hits `continue` — **snapshot is not updated**. Next tick: file still has `userInput`, snapshot still lacks it, delta is the same input again, agent is called again. Loop.
+
+But there's a second path. Even on a successful write, `writeSnapshot` at `snapshot.go:33` silently discards errors (`_ = os.WriteFile(...)`). If that write fails, same outcome — snapshot stays behind, input gets re-submitted.
+
+The file lock is plausible but the silent snapshot failure is guaranteed to loop with no signal at all.
+
+What happens when you look at `.mimi/watch.snapshot` on disk — is it stale relative to `code.mimi`?
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+Already traced this — see what I just surfaced above.
+
+The most plausible cause is **`writeSnapshot` silently swallowing its own failure** (`snapshot.go:33`). If that write fails, the snapshot stays stale, mimi's appended response looks like new user input on the next tick, and the loop runs forever.
+
+Not a file lock. Not a session issue. The replay guard only holds if the snapshot write succeeds — and right now nothing checks whether it does.
+
+What on your machine would cause a write to `.mimi/watch.snapshot` to fail?
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+This message *is* the loop. You just sent me my own previous response as your input — that's the echo in action.
+
+The snapshot question from my last turn still stands: is `.mimi/watch.snapshot` stale relative to `code.mimi` when the loop happens?
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+Two concrete paths on Windows:
+
+**Path 1** — `snapshot.go:32`: `MkdirAll` also discards its error. If `.mimi/` doesn't exist or has a permissions issue, `MkdirAll` fails silently, then `os.WriteFile` fails silently because the directory isn't there. Snapshot never updates.
+
+**Path 2** — the editor itself. VS Code on Windows holds a read lock while displaying the file. `appendResponse` opens with `O_WRONLY|O_APPEND` — that can succeed even with VS Code open. But some autosave configurations trigger a VS Code re-save *after* mimi's append, which rewrites the file from its in-memory buffer — potentially without mimi's suffix if VS Code hadn't re-read yet. File regresses. Snapshot has `current+suffix`. File has `current`. LCS diff finds nothing — but snapshot is now *ahead* of the file, so `writeSnapshot(cfg.Dir, current)` at line 128 resets it backward, and the user's original input is live again next tick.
+
+That second path doesn't require any write failure. It's a race between VS Code's autosave and mimi's append.
+
+Does your editor have autosave on? And is `.mimi/` present on disk in that directory?
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+Still the same loop — you're sending my responses back to me.
+
+Step back: are you running `mimicode watch` right now, or is this the REPL/TUI? The fix direction is completely different depending on which mode is echoing.
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+Confirmed. And the loop is live in this very message — you're watching `code.mimi` echo my prior response back as new input right now.
+
+The fix surface is narrow: `snapshot.go:32-33`. Both `MkdirAll` and `WriteFile` eat their errors. If either fails, the loop runs forever with no signal.
+
+What would you want the caller to do when `writeSnapshot` fails — retry, halt the turn, or surface it to the log?
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+Stop. You're still pasting my output back at me.
+
+Type something new — just tell me: watch mode or REPL?
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+Which mode is active right now — `mimicode watch` or the REPL/TUI?
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+—
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+Watch mode. Those dividers (`─── mimi ───`, `─── your turn ───`) are from `appendResponse` in `notebook.go` — that's `code.mimi`, not the REPL.
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+…
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+I'm going to stay quiet until you type something that isn't a copy of what I just wrote. Ready when you are.
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+—
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+⋯ read watch.go · read snapshot.go · read notebook.go
+
+`snapshot.go:33` — yes, completely silent:
+
+```go
+_ = os.WriteFile(path, []byte(content), 0o644)
+```
+
+Both the `MkdirAll` and `WriteFile` errors are discarded. If the write fails, the snapshot stays at its previous value — the pre-response content. Next tick, `extractNewContent(stale_snapshot, file_with_appended_response)` sees the response text as new input.
+
+Now look at `watch.go:147–155`: `appendResponse` returns `(suffix, err)` and the error is handled (line 148–151 bails out). But what does `suffix` actually contain if the *file write* inside `appendResponse` partially succeeds — say, the `OpenFile` works but `WriteString` at `notebook.go:75` fails?
+
+What does `appendResponse` return in that case, and what does line 155 snapshot?
+
+──────────────────────────── your turn ────────────────────────────
+
+─────────────────────────────── mimi ───────────────────────────────
+
+You've got the full causal chain. One thing to nail down before you fix it:
+
+If `writeSnapshot` fails at `watch.go:155` — after `appendResponse` already wrote to disk — what should the loop do? Retry next tick (which would re-run the agent on the same delta), or skip the tick (which leaves the stale snapshot and risks the echo)? What does `settled` contain at that point, and does it help or hurt?
+
+──────────────────────────── your turn ────────────────────────────

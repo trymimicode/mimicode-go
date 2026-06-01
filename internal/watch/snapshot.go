@@ -20,20 +20,32 @@ func snapshotExists(dir string) bool {
 	return err == nil
 }
 
-// readSnapshot returns the stored snapshot, normalized to LF. Missing file → "".
-func readSnapshot(dir string) string {
-	data, _ := os.ReadFile(snapshotPath(dir))
-	return normalizeLF(string(data))
+// readSnapshot returns the stored snapshot, normalized to LF. Missing file → ("", nil).
+func readSnapshot(dir string) (string, error) {
+	data, err := os.ReadFile(snapshotPath(dir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return normalizeLF(string(data)), nil
 }
 
 // writeSnapshot stores content (caller passes already-normalized text).
-func writeSnapshot(dir, content string) {
+func writeSnapshot(dir, content string) error {
 	path := snapshotPath(dir)
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = os.WriteFile(path, []byte(content), 0o644)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(content), 0o644)
 }
 
 // clearSnapshot drops the anchor so the next Run re-anchors from scratch.
-func clearSnapshot(dir string) {
-	_ = os.Remove(snapshotPath(dir))
+func clearSnapshot(dir string) error {
+	err := os.Remove(snapshotPath(dir))
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
