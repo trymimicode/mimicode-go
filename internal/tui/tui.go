@@ -934,7 +934,7 @@ func renderDiff(diff *tools.DiffInfo, width int) []string {
 
 	if diff.IsNewFile {
 		out = append(out, diffAddMarkStyle.Render("+ new file"))
-		lines := strings.Split(diff.NewContent, "\n")
+		lines := diffSplitLines(diff.NewContent)
 		for i, ln := range lines {
 			num := diffAddMarkStyle.Render(fmt.Sprintf("%4d", i+1))
 			plus := diffAddMarkStyle.Render(" + ")
@@ -942,25 +942,29 @@ func renderDiff(diff *tools.DiffInfo, width int) []string {
 			out = append(out, num+plus+code)
 		}
 	} else {
-		oldLines := strings.Split(diff.OldContent, "\n")
-		newLines := strings.Split(diff.NewContent, "\n")
-		maxOld := len(oldLines)
-		maxNew := len(newLines)
+		oldLines := diffSplitLines(diff.OldContent)
+		newLines := diffSplitLines(diff.NewContent)
 
-		i, j := 0, 0
-		for i < maxOld || j < maxNew {
-			if i < maxOld && j < maxNew && oldLines[i] == newLines[j] {
-				num := diffLineNumStyle.Render(fmt.Sprintf("%4d", i+1))
-				out = append(out, num+"   "+oldLines[i])
+		// LCS-based alignment so inserted/removed lines render as actual
+		// add/remove rows instead of knocking every later line out of sync.
+		common := diffLCS(oldLines, newLines)
+		i, j, k := 0, 0, 0
+		for i < len(oldLines) || j < len(newLines) {
+			switch {
+			case k < len(common) && i < len(oldLines) && j < len(newLines) &&
+				oldLines[i] == common[k] && newLines[j] == common[k]:
+				num := diffLineNumStyle.Render(fmt.Sprintf("%4d", j+1))
+				out = append(out, num+"   "+newLines[j])
 				i++
 				j++
-			} else if i < maxOld {
+				k++
+			case i < len(oldLines) && (k >= len(common) || oldLines[i] != common[k]):
 				num := diffRemMarkStyle.Render(fmt.Sprintf("%4d", i+1))
 				dash := diffRemMarkStyle.Render(" - ")
 				code := diffFadedStyle.Render(oldLines[i])
 				out = append(out, num+dash+code)
 				i++
-			} else {
+			default:
 				num := diffAddMarkStyle.Render(fmt.Sprintf("%4d", j+1))
 				plus := diffAddMarkStyle.Render(" + ")
 				code := diffCodeStyle.Render(newLines[j])
@@ -972,6 +976,59 @@ func renderDiff(diff *tools.DiffInfo, width int) []string {
 
 	out = append(out, "")
 	return out
+}
+
+// diffSplitLines normalizes CRLF/CR to LF and trims a single trailing newline
+// before splitting, so a file that ends in "\n" does not produce a spurious
+// empty line at the bottom of the diff.
+func diffSplitLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.Split(strings.TrimRight(s, "\n"), "\n")
+}
+
+// diffLCS returns the longest common subsequence of a and b (line-level),
+// used to align the old and new versions of a file in the diff view.
+func diffLCS(a, b []string) []string {
+	m, n := len(a), len(b)
+	if m == 0 || n == 0 {
+		return nil
+	}
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
+	}
+	for i := 1; i <= m; i++ {
+		for j := 1; j <= n; j++ {
+			if a[i-1] == b[j-1] {
+				dp[i][j] = dp[i-1][j-1] + 1
+			} else if dp[i-1][j] >= dp[i][j-1] {
+				dp[i][j] = dp[i-1][j]
+			} else {
+				dp[i][j] = dp[i][j-1]
+			}
+		}
+	}
+	result := make([]string, 0, dp[m][n])
+	i, j := m, n
+	for i > 0 && j > 0 {
+		if a[i-1] == b[j-1] {
+			result = append(result, a[i-1])
+			i--
+			j--
+		} else if dp[i-1][j] >= dp[i][j-1] {
+			i--
+		} else {
+			j--
+		}
+	}
+	for l, r := 0, len(result)-1; l < r; l, r = l+1, r-1 {
+		result[l], result[r] = result[r], result[l]
+	}
+	return result
 }
 
 // renderReadingWindow draws the animated file reading view.
