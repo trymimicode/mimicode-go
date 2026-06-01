@@ -24,8 +24,5 @@ sessions/
 .DS_Store
 Thumbs.db
 
-# mimicode watch state
-.mimi/watch.lock
-
-# mimicode watch state
-.mimi/watch.snapshot
+# mimicode runtime notebook (header stamped + answers appended at runtime)
+code.mimi

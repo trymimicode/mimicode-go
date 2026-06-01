@@ -77,32 +77,6 @@ func Clone(ctx context.Context, cwd, raw, ref string) (*Repo, error) {
 	return repo, nil
 }
 
-// List returns the repos currently cached under cwd. Order follows the
-// filesystem walk.
-func List(cwd string) []Repo {
-	root := CacheRoot(cwd)
-	var repos []Repo
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || !d.IsDir() {
-			return nil
-		}
-		if d.Name() == ".git" {
-			return filepath.SkipDir
-		}
-		if isGitRepo(path) {
-			rel, _ := filepath.Rel(root, path)
-			repos = append(repos, Repo{
-				URL:       "https://" + filepath.ToSlash(rel),
-				LocalPath: path,
-				Cached:    true,
-			})
-			return filepath.SkipDir // don't descend into a repo
-		}
-		return nil
-	})
-	return repos
-}
-
 // FileList returns up to max file paths (relative to the repo) via ripgrep,
 // plus the total count rg reported.
 func FileList(localPath string, max int) (string, int) {
@@ -118,26 +92,6 @@ func FileList(localPath string, max int) (string, int) {
 		all = all[:max]
 	}
 	return strings.Join(all, "\n"), total
-}
-
-// Search runs ripgrep for pattern inside a cached repo and returns up to
-// maxLines matching lines (path:line:text). It's how you follow a call site
-// through the real source.
-func Search(ctx context.Context, localPath, pattern string, maxLines int) (string, error) {
-	if maxLines <= 0 {
-		maxLines = 40
-	}
-	cmd := exec.CommandContext(ctx, "rg", "-n", "--no-heading", "-S", pattern)
-	cmd.Dir = localPath
-	out, _ := cmd.Output() // rg exits 1 on no match; treat as empty
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) == 1 && lines[0] == "" {
-		return "", nil
-	}
-	if len(lines) > maxLines {
-		lines = append(lines[:maxLines], fmt.Sprintf("... (%d more matches)", len(lines)-maxLines))
-	}
-	return strings.Join(lines, "\n"), nil
 }
 
 func isGitRepo(dir string) bool {
