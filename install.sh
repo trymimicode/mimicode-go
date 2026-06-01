@@ -3,27 +3,25 @@ set -euo pipefail
 
 # mimicode installer (macOS & Linux)
 #
-# Builds mimicode from source and installs it onto your PATH so you can run
-# `mimicode` from anywhere.
+# Downloads a prebuilt mimicode binary (no Go toolchain required) and installs
+# it to ~/.local/bin, then adds that directory to your PATH via the correct
+# profile file for your shell (zsh, bash, or fish).
 #
 # Quick install:
 #   curl -fsSL https://raw.githubusercontent.com/trymimicode/mimicode-go/main/install.sh | bash
 #
-# Override the install location (default: /usr/local/bin):
-#   INSTALL_DIR=$HOME/bin curl -fsSL .../install.sh | bash
+# Overrides:
+#   INSTALL_DIR=$HOME/bin   ...   install location (default: ~/.local/bin)
+#   MIMICODE_BASE_URL=...         release download base (used by CI tests)
 
 REPO="trymimicode/mimicode-go"
-MODULE="github.com/trymimicode/mimicode-go"
 BINARY_NAME="mimicode"
-CMD_PATH="./cmd/mimicode"
-
-# /usr/local/bin is on PATH by default on virtually every macOS/Linux system,
-# so the binary is reachable everywhere with no shell-profile editing.
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+BASE_URL="${MIMICODE_BASE_URL:-https://github.com/$REPO/releases/latest/download}"
 
 echo "🚀 Installing mimicode..."
 
-# ── Detect OS / arch (used only for the optional prebuilt fast path) ─────────
+# ── Detect OS / architecture ─────────────────────────────────────────────────
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$OS" in
@@ -37,91 +35,74 @@ case "$ARCH" in
     *)             echo "❌ Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-# ── Helper: place a built binary into INSTALL_DIR, using sudo if required ─────
-install_binary() {
-    local src="$1"
-    chmod +x "$src"
-    if mkdir -p "$INSTALL_DIR" 2>/dev/null && [ -w "$INSTALL_DIR" ]; then
-        mv -f "$src" "$INSTALL_DIR/$BINARY_NAME"
-    elif command -v sudo >/dev/null 2>&1; then
-        echo "  $INSTALL_DIR needs elevated permissions; using sudo..."
-        sudo mkdir -p "$INSTALL_DIR"
-        sudo mv -f "$src" "$INSTALL_DIR/$BINARY_NAME"
-    else
-        echo "❌ Cannot write to $INSTALL_DIR and sudo is unavailable."
-        echo "   Re-run with a writable location, e.g.:"
-        echo "     INSTALL_DIR=\$HOME/bin bash install.sh"
-        exit 1
-    fi
-    echo "✓ $BINARY_NAME installed to $INSTALL_DIR/$BINARY_NAME"
-}
+# ── Download the prebuilt binary ─────────────────────────────────────────────
+BINARY_FILE="$BINARY_NAME-$OS-$ARCH"
+DOWNLOAD_URL="$BASE_URL/$BINARY_FILE"
+TMP_BIN="$(mktemp)"
+trap 'rm -f "$TMP_BIN"' EXIT
 
-# ── Build mimicode from source ───────────────────────────────────────────────
-build_from_source() {
-    if ! command -v go >/dev/null 2>&1; then
-        return 1
-    fi
-    echo "✓ Go detected, building from source..."
-
-    local build_dir
-    # If we're already inside the mimicode repo, build right here so the
-    # user's local changes are what get installed.
-    if [ -f go.mod ] && grep -q "^module $MODULE" go.mod 2>/dev/null; then
-        build_dir="$(pwd)"
-        echo "  Building from local checkout: $build_dir"
-    else
-        build_dir="$(mktemp -d)"
-        trap 'rm -rf "$build_dir"' EXIT
-        echo "  Cloning repository..."
-        git clone --depth 1 "https://github.com/$REPO.git" "$build_dir"
-    fi
-
-    # Version metadata matches the Makefile so `mimicode --version` is accurate.
-    local version commit build_date
-    version="$(git -C "$build_dir" describe --tags --always --dirty 2>/dev/null || echo dev)"
-    commit="$(git -C "$build_dir" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-    build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-    echo "  Building binary ($version)..."
-    local out="$build_dir/$BINARY_NAME"
-    ( cd "$build_dir" && go build \
-        -ldflags="-s -w -X main.version=$version -X main.commit=$commit -X main.buildDate=$build_date" \
-        -o "$out" "$CMD_PATH" )
-
-    install_binary "$out"
-    return 0
-}
-
-# ── Optional fast path: download a prebuilt release binary ───────────────────
-download_prebuilt() {
-    command -v curl >/dev/null 2>&1 || return 1
-    local file="$BINARY_NAME-$OS-$ARCH"
-    local url="https://github.com/$REPO/releases/latest/download/$file"
-    local tmp; tmp="$(mktemp)"
-    echo "  Checking for a prebuilt binary..."
-    local code
-    code="$(curl -fL -w '%{http_code}' -o "$tmp" "$url" 2>/dev/null || echo 000)"
-    if [ "$code" = "200" ]; then
-        echo "✓ Downloaded prebuilt binary"
-        install_binary "$tmp"
-        return 0
-    fi
-    rm -f "$tmp"
-    return 1
-}
-
-# Prefer building from source (this is what "create the binary" means); fall
-# back to a prebuilt download if Go isn't available.
-if build_from_source; then
-    :
-elif download_prebuilt; then
-    :
+echo "  Downloading $BINARY_FILE..."
+if command -v curl >/dev/null 2>&1; then
+    HTTP_CODE="$(curl -fL -w '%{http_code}' -o "$TMP_BIN" "$DOWNLOAD_URL" 2>/dev/null || echo 000)"
+elif command -v wget >/dev/null 2>&1; then
+    if wget -qO "$TMP_BIN" "$DOWNLOAD_URL"; then HTTP_CODE="200"; else HTTP_CODE="000"; fi
 else
-    echo "❌ Go is not installed and no prebuilt binary is available."
-    echo "   Install Go 1.26+ from https://go.dev/dl/ and re-run, or grab a"
-    echo "   binary manually from https://github.com/$REPO/releases"
+    echo "❌ Need curl or wget to download mimicode."; exit 1
+fi
+
+if [ "$HTTP_CODE" != "200" ] || [ ! -s "$TMP_BIN" ]; then
+    echo "❌ Could not download a prebuilt binary for $OS/$ARCH (HTTP $HTTP_CODE)."
+    echo "   Check available downloads at https://github.com/$REPO/releases"
     exit 1
 fi
+
+# ── Install ──────────────────────────────────────────────────────────────────
+mkdir -p "$INSTALL_DIR"
+mv -f "$TMP_BIN" "$INSTALL_DIR/$BINARY_NAME"
+chmod +x "$INSTALL_DIR/$BINARY_NAME"
+trap - EXIT
+echo "✓ $BINARY_NAME installed to $INSTALL_DIR/$BINARY_NAME"
+
+# ── Add INSTALL_DIR to PATH using the right profile for the active shell ──────
+add_to_path() {
+    # Already reachable in this session — nothing to wire up.
+    case ":$PATH:" in
+        *":$INSTALL_DIR:"*) return 0 ;;
+    esac
+
+    local shell_name profile line
+    shell_name="$(basename "${SHELL:-sh}")"
+    case "$shell_name" in
+        zsh)
+            profile="${ZDOTDIR:-$HOME}/.zshrc"
+            line="export PATH=\"$INSTALL_DIR:\$PATH\""
+            ;;
+        bash)
+            # macOS login shells read .bash_profile; Linux uses .bashrc.
+            if [ "$OS" = "darwin" ]; then profile="$HOME/.bash_profile"; else profile="$HOME/.bashrc"; fi
+            line="export PATH=\"$INSTALL_DIR:\$PATH\""
+            ;;
+        fish)
+            profile="$HOME/.config/fish/config.fish"
+            line="fish_add_path \"$INSTALL_DIR\""
+            mkdir -p "$(dirname "$profile")"
+            ;;
+        *)
+            profile="$HOME/.profile"
+            line="export PATH=\"$INSTALL_DIR:\$PATH\""
+            ;;
+    esac
+
+    touch "$profile"
+    if grep -qF "$INSTALL_DIR" "$profile" 2>/dev/null; then
+        echo "✓ PATH entry already present in $profile"
+    else
+        printf '\n# Added by mimicode installer\n%s\n' "$line" >> "$profile"
+        echo "✓ Added $INSTALL_DIR to PATH in $profile"
+    fi
+    echo "  Restart your shell or run: source \"$profile\""
+}
+add_to_path
 
 # ── Verify ───────────────────────────────────────────────────────────────────
 if ! "$INSTALL_DIR/$BINARY_NAME" --version >/dev/null 2>&1; then
@@ -137,13 +118,6 @@ if ! command -v rg >/dev/null 2>&1; then
         linux)  echo "   Install: sudo apt install ripgrep   # Debian/Ubuntu"
                 echo "            sudo dnf install ripgrep   # Fedora" ;;
     esac
-fi
-
-if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-    echo ""
-    echo "⚠️  $INSTALL_DIR is not in your PATH."
-    echo "   Add this to your shell profile (~/.bashrc, ~/.zshrc):"
-    echo "     export PATH=\"$INSTALL_DIR:\$PATH\""
 fi
 
 if [ -z "${ANTHROPIC_API_KEY:-}" ]; then

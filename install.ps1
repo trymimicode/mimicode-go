@@ -4,9 +4,9 @@
     mimicode installer for Windows.
 
 .DESCRIPTION
-    Builds mimicode from source and installs it to a per-user location, then
-    adds that location to your user PATH so you can run `mimicode` from any
-    terminal. No administrator rights required.
+    Downloads a prebuilt mimicode binary (no Go toolchain required) and installs
+    it to a per-user location, then adds that location to your user PATH so you
+    can run `mimicode` from any terminal. No administrator rights required.
 
 .EXAMPLE
     irm https://raw.githubusercontent.com/trymimicode/mimicode-go/main/install.ps1 | iex
@@ -18,98 +18,41 @@
 
 $ErrorActionPreference = "Stop"
 
-$Repo        = "trymimicode/mimicode-go"
-$Module      = "github.com/trymimicode/mimicode-go"
-$BinaryName  = "mimicode.exe"
-$CmdPath     = "./cmd/mimicode"
+$Repo       = "trymimicode/mimicode-go"
+$BinaryName = "mimicode"
+$BaseUrl    = if ($env:MIMICODE_BASE_URL) { $env:MIMICODE_BASE_URL } else { "https://github.com/$Repo/releases/latest/download" }
 
-# Per-user, no-admin location that is easy to reach. We add it to the user
-# PATH below so `mimicode` works from anywhere.
+# Per-user, no-admin location. Added to the user PATH below so `mimicode` works
+# from anywhere.
 $InstallDir = if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\mimicode" }
 
 Write-Host "Installing mimicode..." -ForegroundColor Cyan
 
-function Install-Binary([string]$SourcePath) {
-    if (-not (Test-Path $InstallDir)) {
-        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    }
-    $dest = Join-Path $InstallDir $BinaryName
-    Move-Item -Path $SourcePath -Destination $dest -Force
-    Write-Host "OK  $BinaryName installed to $dest" -ForegroundColor Green
-    return $dest
-}
+# ── Detect architecture and download the prebuilt binary ─────────────────────
+$arch = if ([Environment]::Is64BitOperatingSystem) {
+    if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
+} else { "amd64" }
 
-function Build-FromSource {
-    if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
-        return $null
-    }
-    Write-Host "OK  Go detected, building from source..." -ForegroundColor Green
+$asset = "$BinaryName-windows-$arch.exe"
+$url   = "$BaseUrl/$asset"
+$tmp   = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString("N") + ".exe")
 
-    # If we're already inside the mimicode repo, build the local checkout so
-    # local changes are what get installed; otherwise clone a fresh copy.
-    $cleanup = $null
-    if ((Test-Path "go.mod") -and ((Get-Content "go.mod" -TotalCount 1) -match [regex]::Escape("module $Module"))) {
-        $buildDir = (Get-Location).Path
-        Write-Host "    Building from local checkout: $buildDir"
-    } else {
-        if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-            Write-Host "ERR git is required to clone the repository." -ForegroundColor Red
-            return $null
-        }
-        $buildDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mimicode-" + [System.Guid]::NewGuid().ToString("N"))
-        $cleanup = $buildDir
-        Write-Host "    Cloning repository..."
-        git clone --depth 1 "https://github.com/$Repo.git" $buildDir
-    }
-
-    try {
-        # Version metadata matches the Makefile so `mimicode --version` is accurate.
-        Push-Location $buildDir
-        $version = (git describe --tags --always --dirty 2>$null); if (-not $version) { $version = "dev" }
-        $commit  = (git rev-parse --short HEAD 2>$null);          if (-not $commit)  { $commit  = "unknown" }
-        $buildDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-
-        Write-Host "    Building binary ($version)..."
-        $out = Join-Path $buildDir $BinaryName
-        $ldflags = "-s -w -X main.version=$version -X main.commit=$commit -X main.buildDate=$buildDate"
-        go build -ldflags="$ldflags" -o $out $CmdPath
-        Pop-Location
-
-        return (Install-Binary $out)
-    } finally {
-        if ($cleanup -and (Test-Path $cleanup)) {
-            Remove-Item -Recurse -Force $cleanup -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Get-Prebuilt {
-    $arch = if ([Environment]::Is64BitOperatingSystem) {
-        if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
-    } else { "amd64" }
-    $file = "$BinaryName-windows-$arch.exe"
-    $url  = "https://github.com/$Repo/releases/latest/download/$file"
-    $tmp  = Join-Path ([System.IO.Path]::GetTempPath()) $file
-    Write-Host "    Checking for a prebuilt binary..."
-    try {
-        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -ErrorAction Stop
-        Write-Host "OK  Downloaded prebuilt binary" -ForegroundColor Green
-        return (Install-Binary $tmp)
-    } catch {
-        if (Test-Path $tmp) { Remove-Item $tmp -Force }
-        return $null
-    }
-}
-
-# Prefer building from source; fall back to a prebuilt download if Go is absent.
-$installed = Build-FromSource
-if (-not $installed) { $installed = Get-Prebuilt }
-if (-not $installed) {
-    Write-Host "ERR Go is not installed and no prebuilt binary is available." -ForegroundColor Red
-    Write-Host "    Install Go 1.26+ (winget install GoLang.Go) and re-run, or download"
-    Write-Host "    a binary from https://github.com/$Repo/releases"
+Write-Host "  Downloading $asset..."
+try {
+    Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -ErrorAction Stop
+} catch {
+    Write-Host "ERR Could not download a prebuilt binary for windows/$arch." -ForegroundColor Red
+    Write-Host "    Check available downloads at https://github.com/$Repo/releases"
     exit 1
 }
+
+# ── Install ──────────────────────────────────────────────────────────────────
+if (-not (Test-Path $InstallDir)) {
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+}
+$dest = Join-Path $InstallDir "$BinaryName.exe"
+Move-Item -Path $tmp -Destination $dest -Force
+Write-Host "OK  $BinaryName installed to $dest" -ForegroundColor Green
 
 # ── Add install dir to the user PATH (persistent) and current session ────────
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -120,15 +63,16 @@ if ($paths -notcontains $InstallDir) {
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
     Write-Host "OK  Added $InstallDir to your user PATH" -ForegroundColor Green
     Write-Host "    (Open a new terminal for the PATH change to take effect.)"
+} else {
+    Write-Host "OK  PATH entry already present" -ForegroundColor Green
 }
-# Make it usable in the current session too.
 if (($env:Path -split ';') -notcontains $InstallDir) {
     $env:Path = "$InstallDir;$env:Path"
 }
 
 # ── Verify ───────────────────────────────────────────────────────────────────
 try {
-    & $installed --version | Out-Null
+    & $dest --version | Out-Null
 } catch {
     Write-Host "WARN Installed but 'mimicode --version' failed - check the output above." -ForegroundColor Yellow
 }

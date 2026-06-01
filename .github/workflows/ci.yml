@@ -80,3 +80,89 @@ jobs:
 
     - name: Check binary
       run: ./mimicode --help || true
+
+  install-script:
+    name: Install script (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26'
+
+    - name: Build a local "release" binary
+      shell: bash
+      run: |
+        GOOS=$(go env GOOS); GOARCH=$(go env GOARCH)
+        mkdir -p dist
+        go build -ldflags="-X main.version=ci-test" -o "dist/mimicode-$GOOS-$GOARCH" ./cmd/mimicode
+
+    - name: Run install.sh against a local download server
+      shell: bash
+      run: |
+        # Serve the built binary where install.sh expects the release asset.
+        ( cd dist && python3 -m http.server 8765 >/dev/null 2>&1 & )
+        for _ in $(seq 1 20); do curl -sf http://localhost:8765/ >/dev/null && break; sleep 0.5; done
+
+        # Sandbox HOME so the installer writes to throwaway profiles, and pin
+        # the shell so we deterministically exercise the zsh branch.
+        export HOME="$(mktemp -d)"
+        export SHELL=/bin/zsh
+        MIMICODE_BASE_URL="http://localhost:8765" bash install.sh
+
+        # Assert: binary installed to ~/.local/bin and runnable.
+        test -x "$HOME/.local/bin/mimicode"
+        "$HOME/.local/bin/mimicode" --version | grep -q ci-test
+
+        # Assert: PATH was wired into the zsh profile.
+        grep -q '.local/bin' "$HOME/.zshrc"
+        echo "✓ install.sh end-to-end test passed"
+
+  install-script-windows:
+    name: Install script (windows)
+    runs-on: windows-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26'
+
+    - name: Build a local "release" binary
+      shell: pwsh
+      run: |
+        $arch = (go env GOARCH)
+        New-Item -ItemType Directory -Force dist | Out-Null
+        go build -ldflags="-X main.version=ci-test" -o "dist/mimicode-windows-$arch.exe" ./cmd/mimicode
+
+    - name: Run install.ps1 against a local download server
+      shell: pwsh
+      run: |
+        $server = Start-Process python -ArgumentList "-m","http.server","8765" -WorkingDirectory dist -PassThru
+        for ($i = 0; $i -lt 20; $i++) {
+          try { Invoke-WebRequest "http://localhost:8765/" -UseBasicParsing -TimeoutSec 1 | Out-Null; break }
+          catch { Start-Sleep -Milliseconds 500 }
+        }
+
+        $env:INSTALL_DIR = Join-Path $env:RUNNER_TEMP "mimicode-bin"
+        $env:MIMICODE_BASE_URL = "http://localhost:8765"
+        ./install.ps1
+
+        $exe = Join-Path $env:INSTALL_DIR "mimicode.exe"
+        if (-not (Test-Path $exe)) { throw "binary not installed to $exe" }
+        if (-not (& $exe --version | Select-String "ci-test")) { throw "version flag mismatch" }
+
+        # Assert the install dir was persisted to the user PATH.
+        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        if (($userPath -split ';') -notcontains $env:INSTALL_DIR) { throw "install dir not added to user PATH" }
+        Stop-Process -Id $server.Id -Force
+        Write-Host "OK install.ps1 end-to-end test passed"
