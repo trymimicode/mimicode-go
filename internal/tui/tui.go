@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -8,6 +9,10 @@ import (
 	"strings"
 	"time"
 
+	chroma "github.com/alecthomas/chroma/v2"
+	"github.com/alecthomas/chroma/v2/formatters"
+	"github.com/alecthomas/chroma/v2/lexers"
+	"github.com/alecthomas/chroma/v2/styles"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
@@ -125,8 +130,8 @@ var (
 	diffLineNumStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	diffAddMarkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("34")).Bold(true)
 	diffRemMarkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
-	diffCodeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-	diffFadedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	diffCodeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	diffFadedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	readCursorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Background(lipgloss.Color("238")).Bold(true)
 	readDimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	streamHeadStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
@@ -932,18 +937,31 @@ func renderDiff(diff *tools.DiffInfo, width int) []string {
 	header := fmt.Sprintf("━━━ %s %s ━━━", diff.Operation, diff.Path)
 	out = append(out, diffFileStyle.Render(header))
 
+	filename := filepath.Base(diff.Path)
+
 	if diff.IsNewFile {
 		out = append(out, diffAddMarkStyle.Render("+ new file"))
-		lines := diffSplitLines(diff.NewContent)
-		for i, ln := range lines {
+		plainLines := diffSplitLines(diff.NewContent)
+		hlLines := syntaxHighlightLines(diff.NewContent, filename)
+		if len(hlLines) != len(plainLines) {
+			hlLines = plainLines
+		}
+		for i, ln := range hlLines {
 			num := diffAddMarkStyle.Render(fmt.Sprintf("%4d", i+1))
 			plus := diffAddMarkStyle.Render(" + ")
-			code := diffCodeStyle.Render(ln)
-			out = append(out, num+plus+code)
+			out = append(out, num+plus+ln)
 		}
 	} else {
 		oldLines := diffSplitLines(diff.OldContent)
 		newLines := diffSplitLines(diff.NewContent)
+		oldHL := syntaxHighlightLines(diff.OldContent, filename)
+		newHL := syntaxHighlightLines(diff.NewContent, filename)
+		if len(oldHL) != len(oldLines) {
+			oldHL = oldLines
+		}
+		if len(newHL) != len(newLines) {
+			newHL = newLines
+		}
 
 		// LCS-based alignment so inserted/removed lines render as actual
 		// add/remove rows instead of knocking every later line out of sync.
@@ -954,21 +972,19 @@ func renderDiff(diff *tools.DiffInfo, width int) []string {
 			case k < len(common) && i < len(oldLines) && j < len(newLines) &&
 				oldLines[i] == common[k] && newLines[j] == common[k]:
 				num := diffLineNumStyle.Render(fmt.Sprintf("%4d", j+1))
-				out = append(out, num+"   "+newLines[j])
+				out = append(out, num+"   "+newHL[j])
 				i++
 				j++
 				k++
 			case i < len(oldLines) && (k >= len(common) || oldLines[i] != common[k]):
 				num := diffRemMarkStyle.Render(fmt.Sprintf("%4d", i+1))
 				dash := diffRemMarkStyle.Render(" - ")
-				code := diffFadedStyle.Render(oldLines[i])
-				out = append(out, num+dash+code)
+				out = append(out, num+dash+diffLineBg(oldHL[i], "[48;5;236m"))
 				i++
 			default:
 				num := diffAddMarkStyle.Render(fmt.Sprintf("%4d", j+1))
 				plus := diffAddMarkStyle.Render(" + ")
-				code := diffCodeStyle.Render(newLines[j])
-				out = append(out, num+plus+code)
+				out = append(out, num+plus+newHL[j])
 				j++
 			}
 		}
@@ -976,6 +992,41 @@ func renderDiff(diff *tools.DiffInfo, width int) []string {
 
 	out = append(out, "")
 	return out
+}
+
+// syntaxHighlightLines runs content through chroma using the lexer matched to
+// filename and returns the output split into terminal-coloured lines.
+// Falls back to diffSplitLines on any error.
+func syntaxHighlightLines(content, filename string) []string {
+	lx := lexers.Match(filename)
+	if lx == nil {
+		lx = lexers.Fallback
+	}
+	lx = chroma.Coalesce(lx)
+	style := styles.Get("monokai")
+	if style == nil {
+		style = styles.Fallback
+	}
+	fmt := formatters.Get("terminal256")
+	if fmt == nil {
+		return diffSplitLines(content)
+	}
+	var buf bytes.Buffer
+	it, err := lx.Tokenise(nil, content)
+	if err != nil {
+		return diffSplitLines(content)
+	}
+	if err := fmt.Format(&buf, style, it); err != nil {
+		return diffSplitLines(content)
+	}
+	return strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+}
+
+// diffLineBg re-applies bgCode after every ANSI reset in s so a background
+// colour persists across chroma token boundaries.
+func diffLineBg(s, bgCode string) string {
+	const reset = "[0m"
+	return bgCode + strings.ReplaceAll(s, reset, reset+bgCode) + reset
 }
 
 // diffSplitLines normalizes CRLF/CR to LF and trims a single trailing newline
