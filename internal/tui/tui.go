@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -98,8 +99,10 @@ type model struct {
 	allToolLines []line       // tool diffs/reads accumulated across all turns
 
 	program    *tea.Program
-	lineCache  []string // cached output of renderedLines()
-	cacheDirty bool     // true when lineCache must be recomputed
+	lineCache     []string // cached output of renderedLines()
+	cacheDirty    bool     // true when lineCache must be recomputed
+	lineHits      []string // parallel to lineCache; file path or "" per rendered line
+	lineHitsDirty bool
 
 	// files bar / diff view
 	mode         int             // modeChat | modeDiff
@@ -154,6 +157,12 @@ var (
 	slashItemSelStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("237")).Bold(true).PaddingLeft(1)
 	slashCmdStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
 	slashArgStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+)
+
+var (
+	ansiEscRe   = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	backtickRe  = regexp.MustCompile("`([^`]+)`")
+	pathShapeRe = regexp.MustCompile(`[\w.\-/]+\.\w+`)
 )
 
 func RunTUI(sessionID string) error {
@@ -277,6 +286,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleMouseClick(x, y int) {
+	// Check for clickable file paths in the chat area (chat mode only).
+	if m.mode == modeChat {
+		hits := m.cachedLineHits()
+		idx := y + m.scroll
+		if idx >= 0 && idx < len(hits) && hits[idx] != "" {
+			m.openFileInDiff(hits[idx])
+			return
+		}
+	}
+
 	// Files bar is at a fixed row from the bottom:
 	// height - (1 input + 1 status + 1 files bar) = height - 3
 	if len(m.changedFiles) == 0 || m.mode == modeDiff {
@@ -299,8 +318,30 @@ func (m *model) handleMouseClick(x, y int) {
 			m.fileBarFocus = true
 			return
 		}
-		offset += tabWidth + 2 // +2 for separator " │"
+	offset += tabWidth + 2 // +2 for separator " │"
 	}
+}
+
+func (m *model) openFileInDiff(rel string) {
+	content, err := os.ReadFile(filepath.Join(m.cwd, rel))
+	if err != nil {
+		return
+	}
+	d := tools.DiffInfo{
+		Operation:  "view",
+		Path:       rel,
+		IsNewFile:  true,
+		NewContent: string(content),
+	}
+	m.upsertChangedFile(d)
+	for i, f := range m.changedFiles {
+		if f.Path == rel {
+			m.fileIdx = i
+			break
+		}
+	}
+	m.mode = modeDiff
+	m.diffScroll = 0
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -851,6 +892,7 @@ func (m *model) replaceStreamingAssistant() {
 
 func (m *model) bumpCache() {
 	m.cacheDirty = true
+	m.lineHitsDirty = true
 }
 
 func (m *model) renderedLines() []string {
@@ -860,6 +902,38 @@ func (m *model) renderedLines() []string {
 	m.lineCache = m.computeRenderedLines()
 	m.cacheDirty = false
 	return m.lineCache
+}
+
+func (m *model) cachedLineHits() []string {
+	if !m.lineHitsDirty && m.lineHits != nil {
+		return m.lineHits
+	}
+	m.lineHits = m.computeLineHits()
+	m.lineHitsDirty = false
+	return m.lineHits
+}
+
+func (m *model) computeLineHits() []string {
+	rendered := m.renderedLines()
+	hits := make([]string, len(rendered))
+	for i, rl := range rendered {
+		plain := ansiEscRe.ReplaceAllString(rl, "")
+		var candidates []string
+		for _, match := range backtickRe.FindAllStringSubmatch(plain, -1) {
+			candidates = append(candidates, match[1])
+		}
+		for _, p := range pathShapeRe.FindAllString(plain, -1) {
+			candidates = append(candidates, p)
+		}
+		for _, p := range candidates {
+			clean := strings.SplitN(p, ":", 2)[0]
+			if _, err := os.Stat(filepath.Join(m.cwd, clean)); err == nil {
+				hits[i] = clean
+				break
+			}
+		}
+	}
+	return hits
 }
 
 func (m *model) computeRenderedLines() []string {
