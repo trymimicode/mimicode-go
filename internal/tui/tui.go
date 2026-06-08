@@ -110,7 +110,8 @@ type model struct {
 	changedFiles []tools.DiffInfo // deduplicated, latest diff per path
 	fileIdx      int             // selected file (files bar and diff view)
 	fileBarFocus bool            // files bar has keyboard focus
-	diffScroll   int             // scroll offset within diff view
+	diffScroll      int  // scroll offset within diff view
+	diffTypingHint  bool // show navigate-mode hint after rune key in diff view
 
 	// slash commands
 	slashSuggest []int // matching slashDefs indices for current input
@@ -280,12 +281,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.handleMouseClick(msg.X, msg.Y)
 		}
 		if msg.Button == tea.MouseButtonWheelUp {
-			m.scroll -= 3
-			m.clampScroll()
+			if m.mode == modeDiff {
+				m.diffScroll -= 3
+				if m.diffScroll < 0 {
+					m.diffScroll = 0
+				}
+			} else {
+				m.scroll -= 3
+				m.clampScroll()
+			}
 		}
 		if msg.Button == tea.MouseButtonWheelDown {
-			m.scroll += 3
-			m.clampScroll()
+			if m.mode == modeDiff {
+				m.diffScroll += 3
+			} else {
+				m.scroll += 3
+				m.clampScroll()
+			}
 		}
 	}
 	return m, nil
@@ -369,18 +381,26 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.diffScroll = 0
 			}
 		case tea.KeyUp:
+			m.diffTypingHint = false
 			if m.diffScroll > 0 {
 				m.diffScroll--
 			}
 		case tea.KeyDown:
+			m.diffTypingHint = false
 			m.diffScroll++
 		case tea.KeyPgUp:
+			m.diffTypingHint = false
 			m.diffScroll -= m.height - 2
 			if m.diffScroll < 0 {
 				m.diffScroll = 0
 			}
 		case tea.KeyPgDown:
+			m.diffTypingHint = false
 			m.diffScroll += m.height - 2
+		default:
+			if msg.Type == tea.KeyRunes {
+				m.diffTypingHint = true
+			}
 		}
 		return m, nil
 	}
@@ -1074,6 +1094,8 @@ func renderDiff(diff *tools.DiffInfo, width int) []string {
 			out = append(out, num+plus+ln)
 		}
 	} else {
+		const contextLines = 3
+
 		oldLines := diffSplitLines(diff.OldContent)
 		newLines := diffSplitLines(diff.NewContent)
 		oldHL := syntaxHighlightLines(diff.OldContent, filename)
@@ -1085,29 +1107,78 @@ func renderDiff(diff *tools.DiffInfo, width int) []string {
 			newHL = newLines
 		}
 
-		// LCS-based alignment so inserted/removed lines render as actual
-		// add/remove rows instead of knocking every later line out of sync.
+		// LCS walk — build a full row list before emitting anything.
+		type drow struct {
+			kind    string // "ctx", "add", "rem"
+			oldNum  int
+			newNum  int
+			content string
+		}
+		var rows []drow
 		common := diffLCS(oldLines, newLines)
 		i, j, k := 0, 0, 0
 		for i < len(oldLines) || j < len(newLines) {
 			switch {
 			case k < len(common) && i < len(oldLines) && j < len(newLines) &&
 				oldLines[i] == common[k] && newLines[j] == common[k]:
-				num := diffLineNumStyle.Render(fmt.Sprintf("%4d", j+1))
-				out = append(out, num+"   "+newHL[j])
+				rows = append(rows, drow{"ctx", i + 1, j + 1, newHL[j]})
 				i++
 				j++
 				k++
 			case i < len(oldLines) && (k >= len(common) || oldLines[i] != common[k]):
-				num := diffRemMarkStyle.Render(fmt.Sprintf("%4d", i+1))
-				dash := diffRemMarkStyle.Render(" - ")
-				out = append(out, num+dash+diffLineBg(oldHL[i], "[48;5;236m"))
+				rows = append(rows, drow{"rem", i + 1, 0, diffLineBg(oldHL[i], "\x1b[48;5;236m")})
 				i++
 			default:
-				num := diffAddMarkStyle.Render(fmt.Sprintf("%4d", j+1))
-				plus := diffAddMarkStyle.Render(" + ")
-				out = append(out, num+plus+newHL[j])
+				rows = append(rows, drow{"add", 0, j + 1, newHL[j]})
 				j++
+			}
+		}
+
+		// Mark rows within contextLines of any change as visible.
+		visible := make([]bool, len(rows))
+		for idx, r := range rows {
+			if r.kind != "ctx" {
+				lo := idx - contextLines
+				if lo < 0 {
+					lo = 0
+				}
+				hi := idx + contextLines
+				if hi >= len(rows) {
+					hi = len(rows) - 1
+				}
+				for x := lo; x <= hi; x++ {
+					visible[x] = true
+				}
+			}
+		}
+
+		// Emit hunks; insert an @@ header each time a new visible run starts.
+		inHunk := false
+		for idx, r := range rows {
+			if !visible[idx] {
+				inHunk = false
+				continue
+			}
+			if !inHunk {
+				ref := r.newNum
+				if ref == 0 {
+					ref = r.oldNum
+				}
+				out = append(out, diffFadedStyle.Render(fmt.Sprintf("@@ line %d @@", ref)))
+				inHunk = true
+			}
+			switch r.kind {
+			case "ctx":
+				num := diffLineNumStyle.Render(fmt.Sprintf("%4d", r.newNum))
+				out = append(out, num+"   "+r.content)
+			case "rem":
+				num := diffRemMarkStyle.Render(fmt.Sprintf("%4d", r.oldNum))
+				dash := diffRemMarkStyle.Render(" - ")
+				out = append(out, num+dash+r.content)
+			case "add":
+				num := diffAddMarkStyle.Render(fmt.Sprintf("%4d", r.newNum))
+				plus := diffAddMarkStyle.Render(" + ")
+				out = append(out, num+plus+r.content)
 			}
 		}
 	}
@@ -1798,6 +1869,9 @@ func (m *model) renderDiffView() string {
 
 	// ── Hint bar ─────────────────────────────────────────────────────────────
 	hint := fmt.Sprintf(" ←/→ switch file  ↑/↓ scroll  Esc return   %s/%d", filepath.Base(diff.Path), len(m.changedFiles))
+	if m.diffTypingHint {
+		hint = " navigate mode — typing is disabled  ↑/↓ scroll  ←/→ switch file  Esc to return"
+	}
 	b.WriteString(diffHintStyle.Width(max(1, m.width)).Render(hint))
 
 	return b.String()
