@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -114,6 +115,11 @@ type model struct {
 	// slash commands
 	slashSuggest []int // matching slashDefs indices for current input
 	slashSelIdx  int   // which suggestion is highlighted
+
+	// @ file picker
+	atSuggest []string // matching file paths for current @fragment
+	atSelIdx  int
+	allFiles  []string // cached rg --files output
 
 	// accumulated usage across all turns
 	totalUsage provider.Usage
@@ -421,7 +427,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case tea.KeyEsc:
-		// Dismiss slash menu
+		// Dismiss @ and slash menus
+		m.atSuggest = nil
+		m.atSelIdx = 0
 		m.slashSuggest = nil
 		m.slashSelIdx = 0
 
@@ -429,6 +437,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.running {
 			if m.showOnboarding {
 				m.showOnboarding = false
+			} else if len(m.atSuggest) > 0 {
+				m.atCompleteSelected()
+				return m, nil
 			} else if len(m.slashSuggest) > 0 {
 				// Execute highlighted slash command
 				def := slashDefs[m.slashSuggest[m.slashSelIdx]]
@@ -466,6 +477,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input = left + right
 			m.cursor--
 			m.updateSlashSuggest()
+			m.updateAtSuggest()
 		}
 
 	case tea.KeyLeft:
@@ -500,7 +512,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyUp:
-		if len(m.slashSuggest) > 0 {
+		if len(m.atSuggest) > 0 {
+			m.atSelIdx--
+			if m.atSelIdx < 0 {
+				m.atSelIdx = len(m.atSuggest) - 1
+			}
+		} else if len(m.slashSuggest) > 0 {
 			m.slashSelIdx--
 			if m.slashSelIdx < 0 {
 				m.slashSelIdx = len(m.slashSuggest) - 1
@@ -542,7 +559,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyDown:
-		if len(m.slashSuggest) > 0 {
+		if len(m.atSuggest) > 0 {
+			m.atSelIdx = (m.atSelIdx + 1) % len(m.atSuggest)
+		} else if len(m.slashSuggest) > 0 {
 			m.slashSelIdx = (m.slashSelIdx + 1) % len(m.slashSuggest)
 		} else if !m.running {
 			if strings.Contains(m.input, "\n") {
@@ -592,7 +611,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyTab:
 		if !m.running {
-			if len(m.slashSuggest) > 0 {
+			if len(m.atSuggest) > 0 {
+				m.atCompleteSelected()
+				return m, nil
+			} else if len(m.slashSuggest) > 0 {
 				// Complete to selected command
 				def := slashDefs[m.slashSuggest[m.slashSelIdx]]
 				suffix := ""
@@ -654,6 +676,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input = left + msg.String() + right
 			m.cursor += len(msg.String())
 			m.updateSlashSuggest()
+			m.updateAtSuggest()
 		}
 	}
 	return m, nil
@@ -685,6 +708,11 @@ func (m *model) View() string {
 	}
 	for i := end - m.scroll; i < rows; i++ {
 		b.WriteString("\n")
+	}
+
+	// @ file picker menu
+	if len(m.atSuggest) > 0 {
+		b.WriteString(m.renderAtMenu())
 	}
 
 	// Slash command menu (above files bar / status)
@@ -763,6 +791,8 @@ func (m *model) submit() {
 	m.cursor = 0
 	m.slashSuggest = nil
 	m.slashSelIdx = 0
+	m.atSuggest = nil
+	m.atSelIdx = 0
 	m.running = true
 	m.step++
 	m.spinner = 0
@@ -1409,6 +1439,7 @@ func (m *model) chatRows() int {
 		reserved++
 	}
 	reserved += m.slashMenuHeight()
+	reserved += m.atMenuHeight()
 	r := m.height - reserved
 	if r < 1 {
 		return 1
@@ -1436,6 +1467,114 @@ func (m *model) upsertChangedFile(d tools.DiffInfo) {
 		}
 	}
 	m.changedFiles = append(m.changedFiles, d)
+}
+
+// atFragmentAtCursor returns the start index and text of the @word immediately
+// before the cursor, or (-1, "") if the cursor is not inside an @fragment.
+func (m *model) atFragmentAtCursor() (start int, fragment string) {
+	left := m.input[:m.cursor]
+	at := strings.LastIndex(left, "@")
+	if at == -1 {
+		return -1, ""
+	}
+	frag := left[at+1:]
+	if strings.ContainsAny(frag, " \t\n") {
+		return -1, ""
+	}
+	return at, frag
+}
+
+// updateAtSuggest recomputes @ file suggestions from the current input.
+func (m *model) updateAtSuggest() {
+	start, frag := m.atFragmentAtCursor()
+	if start == -1 {
+		m.atSuggest = nil
+		m.atSelIdx = 0
+		return
+	}
+	if len(m.allFiles) == 0 {
+		m.loadAllFiles()
+	}
+	lower := strings.ToLower(frag)
+	prev := len(m.atSuggest)
+	m.atSuggest = m.atSuggest[:0]
+	for _, f := range m.allFiles {
+		if strings.Contains(strings.ToLower(f), lower) {
+			m.atSuggest = append(m.atSuggest, f)
+			if len(m.atSuggest) >= 50 {
+				break
+			}
+		}
+	}
+	if len(m.atSuggest) != prev {
+		m.atSelIdx = 0
+	}
+	if m.atSelIdx >= len(m.atSuggest) {
+		m.atSelIdx = 0
+	}
+}
+
+// loadAllFiles populates m.allFiles via rg --files in the project root.
+func (m *model) loadAllFiles() {
+	cmd := exec.Command("rg", "--files")
+	cmd.Dir = m.cwd
+	out, _ := cmd.Output()
+	if len(out) == 0 {
+		return
+	}
+	m.allFiles = strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+}
+
+// atCompleteSelected replaces the @fragment under the cursor with the selected path.
+func (m *model) atCompleteSelected() {
+	if len(m.atSuggest) == 0 {
+		return
+	}
+	start, _ := m.atFragmentAtCursor()
+	if start == -1 {
+		return
+	}
+	path := m.atSuggest[m.atSelIdx]
+	right := m.input[m.cursor:]
+	m.input = m.input[:start] + "@" + path + right
+	m.cursor = start + 1 + len(path)
+	m.atSuggest = nil
+	m.atSelIdx = 0
+}
+
+func (m *model) atMenuHeight() int {
+	n := len(m.atSuggest)
+	if n == 0 {
+		return 0
+	}
+	if n > 8 {
+		n = 8
+	}
+	return n + 1 // items + header line
+}
+
+func (m *model) renderAtMenu() string {
+	var b strings.Builder
+	n := len(m.atSuggest)
+	if n > 8 {
+		n = 8
+	}
+	header := slashMenuBorderStyle.Width(max(1, m.width)).Render(" files")
+	b.WriteString(header)
+	b.WriteString("\n")
+	for i := 0; i < n; i++ {
+		path := m.atSuggest[i]
+		dir := filepath.Dir(path)
+		base := filepath.Base(path)
+		label := slashArgStyle.Render(dir+string(filepath.Separator)) + slashCmdStyle.Render(base)
+		if i == m.atSelIdx {
+			b.WriteString(slashItemSelStyle.Width(max(1, m.width)).Render("▸ " + label))
+		} else {
+			b.WriteString(slashItemStyle.Width(max(1, m.width)).Render(label))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // updateSlashSuggest recomputes slash suggestions from the current input.
