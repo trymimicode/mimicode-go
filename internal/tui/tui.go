@@ -64,6 +64,7 @@ type line struct {
 type readingFile struct {
 	path    string
 	lines   []string
+	hlLines []string // syntax-highlighted version of lines
 	cursor  int
 	speed   int
 	lineIdx int // index in m.lines where the placeholder sits
@@ -804,11 +805,19 @@ func (m *model) handleStream(msg streamMsg) {
 			if speed < 2 {
 				speed = 2
 			}
+			hlLines := syntaxHighlightLines(strings.Join(lines, "\n"), filepath.Base(path))
+			for len(hlLines) < len(lines) {
+				hlLines = append(hlLines, "")
+			}
+			if len(hlLines) != len(lines) {
+				hlLines = lines
+			}
 			lineIdx := len(m.lines)
 			m.lines = append(m.lines, line{Kind: "reading", Text: path})
 			m.reading = &readingFile{
 				path:    path,
 				lines:   lines,
+				hlLines: hlLines,
 				cursor:  0,
 				speed:   speed,
 				lineIdx: lineIdx,
@@ -998,6 +1007,7 @@ func renderDiff(diff *tools.DiffInfo, width int) []string {
 // filename and returns the output split into terminal-coloured lines.
 // Falls back to diffSplitLines on any error.
 func syntaxHighlightLines(content, filename string) []string {
+	content = strings.ReplaceAll(content, "\t", "    ")
 	lx := lexers.Match(filename)
 	if lx == nil {
 		lx = lexers.Fallback
@@ -1019,7 +1029,7 @@ func syntaxHighlightLines(content, filename string) []string {
 	if err := fmt.Format(&buf, style, it); err != nil {
 		return diffSplitLines(content)
 	}
-	return strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	return diffSplitLines(buf.String())
 }
 
 // diffLineBg re-applies bgCode after every ANSI reset in s so a background
@@ -1110,14 +1120,17 @@ func renderReadingWindow(r *readingFile, width int) []string {
 
 	for i := start; i < end; i++ {
 		lineNum := fmt.Sprintf("%4d", i+1)
-		content := r.lines[i]
-		if len(content) > maxContent {
-			content = content[:maxContent]
+		hl := r.hlLines[i]
+		plain := r.lines[i]
+		if len(plain) > maxContent {
+			// truncate by rune count on the plain version; use plain as fallback
+			hl = plain[:maxContent]
+			plain = plain[:maxContent]
 		}
 		if i == r.cursor {
-			out = append(out, diffLineNumStyle.Render(lineNum)+" "+readCursorStyle.Render("► "+content))
+			out = append(out, diffLineNumStyle.Render(lineNum)+" "+readCursorStyle.Render("► ")+hl)
 		} else {
-			out = append(out, diffLineNumStyle.Render(lineNum)+"   "+readDimStyle.Render(content))
+			out = append(out, diffLineNumStyle.Render(lineNum)+"   "+hl)
 		}
 	}
 
@@ -1132,7 +1145,7 @@ func parseReadOutput(output string) []string {
 	var lines []string
 	for _, l := range strings.Split(output, "\n") {
 		if idx := strings.Index(l, "|"); idx >= 0 {
-			lines = append(lines, l[idx+1:])
+			lines = append(lines, strings.TrimRight(l[idx+1:], "\r"))
 		}
 	}
 	return lines
