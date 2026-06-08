@@ -670,11 +670,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	default:
-		if !m.running {
+		if !m.running && msg.Type == tea.KeyRunes {
+			text := string(msg.Runes)
 			left := m.input[:m.cursor]
 			right := m.input[m.cursor:]
-			m.input = left + msg.String() + right
-			m.cursor += len(msg.String())
+			m.input = left + text + right
+			m.cursor += len(text)
 			m.updateSlashSuggest()
 			m.updateAtSuggest()
 		}
