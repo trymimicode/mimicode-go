@@ -264,6 +264,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
 			m.handleMouseClick(msg.X, msg.Y)
 		}
+		if msg.Button == tea.MouseButtonWheelUp {
+			m.scroll -= 3
+			m.clampScroll()
+		}
+		if msg.Button == tea.MouseButtonWheelDown {
+			m.scroll += 3
+			m.clampScroll()
+		}
 	}
 	return m, nil
 }
