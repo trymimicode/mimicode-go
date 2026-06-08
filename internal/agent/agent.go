@@ -700,3 +700,8 @@ func IsStuck(err error) (AgentStuck, bool) {
 	}
 	return AgentStuck{}, false
 }
+
+// IsMaxSteps reports whether the stuck error was caused by exhausting the step budget.
+func IsMaxSteps(s AgentStuck) bool {
+	return strings.Contains(s.Reason, "step budget")
+}

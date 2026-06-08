@@ -268,17 +268,42 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 		var turnErr error
 		messages, turnErr = agentTurn(ctx, turnCfg, prompt, messages)
 		if stuck, ok := agent.IsStuck(turnErr); ok {
-			recoveryPrompt, apply := proposeRecovery(ctx, reader, sess, cwd, cp, prompt, stuck, errOut)
-			if !apply {
-				_ = sess.SaveMessages(messages)
-				continue
-			}
-			messages = before // clean context: drop the failed turn, retry fresh
-			messages, turnErr = agentTurn(ctx, cfg, recoveryPrompt, messages)
-			if stuck2, ok := agent.IsStuck(turnErr); ok {
-				fmt.Fprintf(errOut, "recovery attempt still stuck: %s\n", stuck2.Reason)
-				_ = sess.SaveMessages(messages)
-				continue
+			if agent.IsMaxSteps(stuck) {
+				fmt.Fprintf(errOut, "  [hit step budget] continue? [y/n]: ")
+				line, _ := reader.ReadString('\n')
+				if strings.ToLower(strings.TrimSpace(line)) != "y" {
+					_ = sess.SaveMessages(messages)
+					if err == io.EOF {
+						break
+					}
+					continue
+				}
+				messages, turnErr = agentTurn(ctx, cfg, "continue", messages)
+				if stuck2, ok := agent.IsStuck(turnErr); ok {
+					fmt.Fprintf(errOut, "  still stuck after continue: %s\n", stuck2.Reason)
+					_ = sess.SaveMessages(messages)
+					continue
+				}
+			} else {
+				fmt.Fprintf(errOut, "  [auto-retry: %s]\n", stuck.Reason)
+				diag, derr := recovery.Diagnose(ctx, sess, stuck.Reason)
+				retryPrompt := prompt
+				if derr == nil {
+					if diag.Rule != "" {
+						if rerr := memory.AppendRule(cwd, diag.Rule); rerr == nil {
+							fmt.Fprintln(errOut, "  rule added to .mimi/RULES.md")
+						}
+					}
+					retryPrompt = buildRecoveryPrompt(prompt, diag)
+				}
+				cp.Snapshot("before auto-retry")
+				messages = before
+				messages, turnErr = agentTurn(ctx, cfg, retryPrompt, messages)
+				if stuck2, ok := agent.IsStuck(turnErr); ok {
+					fmt.Fprintf(errOut, "  still stuck after auto-retry: %s\n", stuck2.Reason)
+					_ = sess.SaveMessages(messages)
+					continue
+				}
 			}
 		}
 		if turnErr != nil {
