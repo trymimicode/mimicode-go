@@ -82,6 +82,14 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 	if len(args) > 0 && args[0] == "key" {
 		return runKeyCmd(args[1:], out, errOut)
 	}
+	if len(args) > 0 && args[0] == "install" {
+		cwd, err := getwd()
+		if err != nil {
+			fmt.Fprintf(errOut, "mimicode: get cwd: %v\n", err)
+			return 1
+		}
+		return runInstallCmd(args[1:], cwd, out, errOut)
+	}
 
 	fs := flag.NewFlagSet("mimicode", flag.ContinueOnError)
 	fs.SetOutput(errOut)

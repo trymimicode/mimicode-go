@@ -26,3 +26,6 @@ Thumbs.db
 
 # mimicode runtime notebook (header stamped + answers appended at runtime)
 code.mimi
+
+# mimicode watch state
+.mimi/watch.snapshot
