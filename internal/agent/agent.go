@@ -264,7 +264,7 @@ func BuildSystem(cwd string) string {
 
 // projectContextFiles are the conventional names projects use to instruct coding
 // agents, in priority order. The first one found wins.
-var projectContextFiles = []string{"AGENTS.md", "CLAUDE.md", ".mimi/AGENTS.md"}
+var projectContextFiles = []string{".mimi/AGENTS.md", "AGENTS.md", "CLAUDE.md"}
 
 // loadProjectContext returns the path and contents of the project's own
 // agent-instructions file (AGENTS.md / CLAUDE.md), if present. Oversized files
