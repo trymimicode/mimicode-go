@@ -230,6 +230,40 @@ func sseEvent(obj any) string {
 	return "data: " + string(b) + "\n\n"
 }
 
+// TestCallClaudeStreamingIncomplete locks in the silent-truncation fix: a stream
+// that ends without a terminal message_stop (a dropped/half-closed connection)
+// must be reported as an error, not returned as a successful partial turn.
+func TestCallClaudeStreamingIncomplete(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "test-key-incomplete")
+	t.Setenv("MIMICODE_THINKING", "off")
+
+	var sb strings.Builder
+	for _, evt := range []any{
+		map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant", "content": []any{}, "usage": map[string]any{"input_tokens": 5}}},
+		map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}},
+		map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "half a thou"}},
+		// connection drops here — NO content_block_stop, NO message_stop
+	} {
+		sb.WriteString(sseEvent(evt))
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, sb.String())
+	}))
+	defer ts.Close()
+	overrideBase(t, ts)
+
+	messages, tools := testInput()
+	_, _, err := CallClaudeStreaming(context.Background(), messages, "you are helpful", tools, "claude-opus-4-7", nil)
+	if err == nil {
+		t.Fatal("expected an error for a stream that ended without message_stop, got nil")
+	}
+	if !strings.Contains(err.Error(), "before completion") {
+		t.Errorf("error should flag premature completion, got: %v", err)
+	}
+}
+
 func TestCallClaudeStreaming(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "test-key-stream")
 	t.Setenv("MIMICODE_THINKING", "off") // baseline request shape

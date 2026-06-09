@@ -70,7 +70,9 @@ func RunReflect(ctx context.Context, sess *store.Session, cwd string) error {
 		if strings.TrimSpace(rule) == "" {
 			continue
 		}
-		if err := memory.AppendRule(cwd, rule); err != nil {
+		// Reflect rules describe how this engineer works, so they belong in the
+		// user-level RULES.md and carry across every project.
+		if err := memory.AppendGlobalRule(rule); err != nil {
 			warn("append rule: %v", err)
 		}
 	}
@@ -93,7 +95,7 @@ func parseReflection(raw string) reflection {
 }
 
 func existingRulesOrNone(cwd string) string {
-	if rules := strings.TrimSpace(memory.LoadRules(cwd)); rules != "" {
+	if rules := strings.TrimSpace(memory.LoadAllRules(cwd)); rules != "" {
 		return rules
 	}
 	return "(none yet)"

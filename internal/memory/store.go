@@ -12,14 +12,78 @@ func mimiDir(cwd string) string {
 	return filepath.Join(cwd, ".mimi")
 }
 
+// globalDir returns the user-level mimicode config directory (e.g.
+// ~/Library/Application Support/mimicode on macOS), where cross-project
+// behavioral rules — how this engineer works — live. MIMICODE_CONFIG_DIR
+// overrides it (used by tests and power users). Returns "" if neither resolves.
+func globalDir() string {
+	if override := strings.TrimSpace(os.Getenv("MIMICODE_CONFIG_DIR")); override != "" {
+		return override
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "mimicode")
+}
+
 // LoadMemory returns the contents of .mimi/MEMORY.md, or "" if absent.
 func LoadMemory(cwd string) string {
 	return readFile(filepath.Join(mimiDir(cwd), "MEMORY.md"))
 }
 
-// LoadRules returns the contents of .mimi/RULES.md, or "" if absent.
+// LoadRules returns the contents of the project's .mimi/RULES.md, or "" if absent.
 func LoadRules(cwd string) string {
 	return readFile(filepath.Join(mimiDir(cwd), "RULES.md"))
+}
+
+// LoadGlobalRules returns the contents of the user-level RULES.md (how this
+// engineer works, applied across every project), or "" if absent.
+func LoadGlobalRules() string {
+	dir := globalDir()
+	if dir == "" {
+		return ""
+	}
+	return readFile(filepath.Join(dir, "RULES.md"))
+}
+
+// LoadAllRules merges global (cross-project) rules with this project's local
+// rules, global first, into one block for the system prompt. Either side may be
+// empty.
+func LoadAllRules(cwd string) string {
+	var parts []string
+	if g := strings.TrimSpace(LoadGlobalRules()); g != "" {
+		parts = append(parts, g)
+	}
+	if p := strings.TrimSpace(LoadRules(cwd)); p != "" {
+		parts = append(parts, p)
+	}
+	return strings.Join(parts, "\n")
+}
+
+// AppendGlobalRule appends a behavioral rule to the user-level RULES.md, dated.
+// Used by the reflect loop to record how this engineer works so the lesson
+// carries across every project, not just the one it was learned in.
+func AppendGlobalRule(rule string) error {
+	rule = strings.TrimSpace(rule)
+	if rule == "" {
+		return fmt.Errorf("empty rule")
+	}
+	dir := globalDir()
+	if dir == "" {
+		return fmt.Errorf("cannot resolve user config dir")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "RULES.md")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "- %s _(learned %s)_\n", rule, time.Now().UTC().Format("2006-01-02"))
+	return err
 }
 
 // AppendRule appends a single behavioral rule to .mimi/RULES.md, dated.

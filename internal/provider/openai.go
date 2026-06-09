@@ -86,6 +86,8 @@ type oaiChunk struct {
 func toOAIMessages(messages []Message, system string) []oaiMsg {
 	var out []oaiMsg
 	if system != "" {
+		// OpenAI has no cache breakpoints; fold the marker back into plain text.
+		system = strings.ReplaceAll(system, SystemCacheBreak, "\n\n")
 		out = append(out, oaiMsg{Role: "system", Content: system})
 	}
 	for _, m := range messages {

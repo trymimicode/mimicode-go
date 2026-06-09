@@ -52,6 +52,15 @@ type CacheControl struct {
 	Type string // "ephemeral"
 }
 
+// SystemCacheBreak is an in-band marker the caller embeds in the system string
+// to separate the static persona (a stable, cacheable prefix) from the volatile
+// per-turn context (env, repomap, rules, memory). The Claude builder splits on
+// it into separate system blocks so the persona prefix stays cached even when
+// the context changes; the OpenAI builder collapses it back to a blank line.
+// It is a control char (US, 0x1F) that never appears in prompt prose, and it is
+// always stripped before the request reaches the model.
+const SystemCacheBreak = "\x1f"
+
 // Usage records token consumption for one API call.
 type Usage struct {
 	InputTokens  int
