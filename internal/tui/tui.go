@@ -220,7 +220,12 @@ func RunTUI(sessionID string) error {
 	if err != nil {
 		return err
 	}
-	sess, messages, err := store.ResumeOrNew(sessionID, cwd, provider.DefaultModel())
+	cfg, _ := config.Load()
+	startModel := provider.DefaultModel()
+	if cfg.DefaultModel != "" {
+		startModel = cfg.DefaultModel
+	}
+	sess, messages, err := store.ResumeOrNew(sessionID, cwd, startModel)
 	if err != nil {
 		return fmt.Errorf("start session: %w", err)
 	}
@@ -238,6 +243,16 @@ func RunTUI(sessionID string) error {
 		cursor:   0,
 		history:  []string{},
 		historyIdx: -1,
+	}
+	if cfg.DefaultModel != "" {
+		m.modelOverride = cfg.DefaultModel
+		m.modelName = cfg.DefaultModel
+	}
+	switch cfg.DefaultProvider {
+	case "kimi":
+		m.providerOverride = provider.Kimi
+	case "minimax":
+		m.providerOverride = provider.MiniMax
 	}
 	// Show onboarding if this is a new session with no messages
 	m.showOnboarding = len(messages) == 0
@@ -693,6 +708,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.modelOverride = provider.MiniMax.DefaultModel()
 			}
 			m.modelName = m.modelOverride
+			saveDefaultModelProvider(m.modelOverride, m.providerOverride)
 			m.lines = append(m.lines, line{Kind: "tool", Text: "key saved · switched to " + shortModel(m.modelOverride)})
 			m.bumpCache()
 			return m, nil
@@ -951,8 +967,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	default:
-		if !m.running && msg.Type == tea.KeyRunes {
+		if !m.running && (msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace) {
 			text := string(msg.Runes)
+			if msg.Type == tea.KeySpace {
+				text = " "
+			}
 			if strings.Contains(text, "\n") {
 				// Multi-line paste: keep real text in m.input but record as atomic entity.
 				nLines := strings.Count(text, "\n") + 1
@@ -1128,7 +1147,8 @@ func (m *model) submit() {
 		m.history = m.history[1:]
 	}
 	m.historyIdx = -1
-	
+	isFirst := len(m.messages) == 0 && m.session != nil
+
 	m.input = ""
 	m.cursor = 0
 	m.pasteEntities = nil
@@ -1159,6 +1179,11 @@ func (m *model) submit() {
 	m.scrollToBottom()
 
 	m.lastPrompt = prompt
+	if isFirst {
+		if slug := sessionSlug(prompt); slug != "" {
+			_ = m.session.Rename(store.AvailableSlug(slug))
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	before := append([]provider.Message(nil), m.messages[:len(m.messages)-1]...)
@@ -1901,6 +1926,49 @@ func shortModel(model string) string {
 	}
 }
 
+func saveDefaultModelProvider(modelOverride string, prov provider.Provider) {
+	cfg, err := config.Load()
+	if err != nil {
+		cfg = config.Config{}
+	}
+	cfg.DefaultModel = modelOverride
+	if prov == provider.Kimi {
+		cfg.DefaultProvider = "kimi"
+	} else if prov == provider.MiniMax {
+		cfg.DefaultProvider = "minimax"
+	} else {
+		cfg.DefaultProvider = ""
+	}
+	_ = config.Save(cfg)
+}
+
+func sessionSlug(prompt string) string {
+	words := strings.Fields(strings.ToLower(prompt))
+	if len(words) > 6 {
+		words = words[:6]
+	}
+	var parts []string
+	for _, w := range words {
+		var b strings.Builder
+		for _, r := range []rune(w) {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				b.WriteRune(r)
+			}
+		}
+		if s := b.String(); s != "" {
+			parts = append(parts, s)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	slug := strings.Join(parts, "-")
+	if len(slug) > 40 {
+		slug = slug[:40]
+	}
+	return slug
+}
+
 func estimateCost(u provider.Usage) float64 {
 	// Rough blended display-only estimate until model-specific accounting lands.
 	return float64(u.InputTokens+u.OutputTokens) / 1_000_000 * 3.0
@@ -2124,6 +2192,7 @@ func (m *model) executeSlash(cmd string, args []string) {
 				return
 			}
 			m.modelName = m.modelOverride
+			saveDefaultModelProvider(m.modelOverride, m.providerOverride)
 			m.lines = append(m.lines, line{Kind: "tool", Text: "switched to " + shortModel(m.modelOverride)})
 		}
 		m.bumpCache()
@@ -2166,6 +2235,7 @@ func (m *model) executeSlash(cmd string, args []string) {
 				return
 			}
 			m.modelName = m.modelOverride
+			saveDefaultModelProvider(m.modelOverride, m.providerOverride)
 			m.lines = append(m.lines, line{Kind: "tool", Text: "switched to " + shortModel(m.modelOverride)})
 		}
 		m.bumpCache()

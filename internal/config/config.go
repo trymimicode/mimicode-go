@@ -14,6 +14,8 @@ type Config struct {
 	AnthropicAPIKey string `json:"anthropic_api_key,omitempty"`
 	MoonshotAPIKey  string `json:"moonshot_api_key,omitempty"`
 	MinimaxAPIKey   string `json:"minimax_api_key,omitempty"`
+	DefaultModel    string `json:"default_model,omitempty"`
+	DefaultProvider string `json:"default_provider,omitempty"`
 }
 
 // FilePath returns the platform config file path.
