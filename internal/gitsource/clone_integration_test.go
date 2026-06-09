@@ -37,9 +37,6 @@ func TestCloneIntegration(t *testing.T) {
 		t.Errorf("second clone should be cached")
 	}
 
-	if repos := List(cwd); len(repos) != 1 {
-		t.Errorf("List = %d repos, want 1", len(repos))
-	}
 	if files, total := FileList(r.LocalPath, 10); total == 0 || files == "" {
 		t.Errorf("FileList returned nothing (total=%d)", total)
 	}

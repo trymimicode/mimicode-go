@@ -82,6 +82,14 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 	if len(args) > 0 && args[0] == "key" {
 		return runKeyCmd(args[1:], out, errOut)
 	}
+	if len(args) > 0 && args[0] == "install" {
+		cwd, err := getwd()
+		if err != nil {
+			fmt.Fprintf(errOut, "mimicode: get cwd: %v\n", err)
+			return 1
+		}
+		return runInstallCmd(args[1:], cwd, out, errOut)
+	}
 
 	fs := flag.NewFlagSet("mimicode", flag.ContinueOnError)
 	fs.SetOutput(errOut)
@@ -153,6 +161,8 @@ func startupChecks(errOut io.Writer) error {
 	}
 	if strings.TrimSpace(getenv("ANTHROPIC_API_KEY")) == "" {
 		fmt.Fprintln(errOut, "mimicode: ANTHROPIC_API_KEY is not set")
+		fmt.Fprintln(errOut, "  set it permanently:  mimicode key --set <your-key>")
+		fmt.Fprintln(errOut, "  or for this session: export ANTHROPIC_API_KEY=<your-key>")
 		return fmt.Errorf("missing ANTHROPIC_API_KEY")
 	}
 	return nil
@@ -173,6 +183,10 @@ func runOneShot(ctx context.Context, sessionID, cwd, prompt string, in io.Reader
 	if confirm {
 		cfg.ConfirmTool = makeConfirmTool(bufio.NewReader(in), errOut)
 	}
+	if strings.HasSuffix(prompt, "--force") {
+		prompt = strings.TrimSpace(strings.TrimSuffix(prompt, "--force"))
+		cfg.Force = true
+	}
 	var err error
 	messages, err = agentTurn(ctx, cfg, prompt, messages)
 	if stuck, ok := agent.IsStuck(err); ok {
@@ -189,6 +203,7 @@ func runOneShot(ctx context.Context, sessionID, cwd, prompt string, in io.Reader
 		printAgentErr(errOut, err)
 		return 1
 	}
+	renameSessionOnce(ctx, sess, prompt, errOut)
 	if err := sess.SaveMessages(messages); err != nil {
 		fmt.Fprintf(errOut, "mimicode: save messages: %v\n", err)
 		return 1
@@ -211,7 +226,7 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 	cfg := agent.AgentConfig{CWD: cwd, Session: sess, MaxSteps: 25}
 	cp := checkpoint.New(sess.Path(), cwd)
 	cp.Snapshot("session start")
-	fmt.Fprintln(errOut, "[mimicode] REPL. empty line or :q / ctrl-d to exit. :compact compaction, :undo [n] revert turns.")
+	fmt.Fprintln(errOut, "[mimicode] REPL. empty line or :q / ctrl-d to exit. :compact compaction, :undo [n] revert turns. Append --force to skip brevity rules.")
 
 	turn := 0
 	reader := bufio.NewReader(in)
@@ -225,6 +240,11 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 			return 1
 		}
 		prompt := strings.TrimSpace(line)
+		turnCfg := cfg
+		if strings.HasSuffix(prompt, "--force") {
+			prompt = strings.TrimSpace(strings.TrimSuffix(prompt, "--force"))
+			turnCfg.Force = true
+		}
 		if err == io.EOF && prompt == "" {
 			break
 		}
@@ -249,19 +269,44 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 		printTurnStart(errOut, sess)
 		before := append([]provider.Message(nil), messages...)
 		var turnErr error
-		messages, turnErr = agentTurn(ctx, cfg, prompt, messages)
+		messages, turnErr = agentTurn(ctx, turnCfg, prompt, messages)
 		if stuck, ok := agent.IsStuck(turnErr); ok {
-			recoveryPrompt, apply := proposeRecovery(ctx, reader, sess, cwd, cp, prompt, stuck, errOut)
-			if !apply {
-				_ = sess.SaveMessages(messages)
-				continue
-			}
-			messages = before // clean context: drop the failed turn, retry fresh
-			messages, turnErr = agentTurn(ctx, cfg, recoveryPrompt, messages)
-			if stuck2, ok := agent.IsStuck(turnErr); ok {
-				fmt.Fprintf(errOut, "recovery attempt still stuck: %s\n", stuck2.Reason)
-				_ = sess.SaveMessages(messages)
-				continue
+			if agent.IsMaxSteps(stuck) {
+				fmt.Fprintf(errOut, "  [hit step budget] continue? [y/n]: ")
+				line, _ := reader.ReadString('\n')
+				if strings.ToLower(strings.TrimSpace(line)) != "y" {
+					_ = sess.SaveMessages(messages)
+					if err == io.EOF {
+						break
+					}
+					continue
+				}
+				messages, turnErr = agentTurn(ctx, cfg, "continue", messages)
+				if stuck2, ok := agent.IsStuck(turnErr); ok {
+					fmt.Fprintf(errOut, "  still stuck after continue: %s\n", stuck2.Reason)
+					_ = sess.SaveMessages(messages)
+					continue
+				}
+			} else {
+				fmt.Fprintf(errOut, "  [auto-retry: %s]\n", stuck.Reason)
+				diag, derr := recovery.Diagnose(ctx, sess, stuck.Reason)
+				retryPrompt := prompt
+				if derr == nil {
+					if diag.Rule != "" {
+						if rerr := memory.AppendRule(cwd, diag.Rule); rerr == nil {
+							fmt.Fprintln(errOut, "  rule added to .mimi/RULES.md")
+						}
+					}
+					retryPrompt = buildRecoveryPrompt(prompt, diag)
+				}
+				cp.Snapshot("before auto-retry")
+				messages = before
+				messages, turnErr = agentTurn(ctx, cfg, retryPrompt, messages)
+				if stuck2, ok := agent.IsStuck(turnErr); ok {
+					fmt.Fprintf(errOut, "  still stuck after auto-retry: %s\n", stuck2.Reason)
+					_ = sess.SaveMessages(messages)
+					continue
+				}
 			}
 		}
 		if turnErr != nil {
@@ -270,6 +315,9 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 				break
 			}
 			return 1
+		}
+		if turn == 0 {
+			renameSessionOnce(ctx, sess, prompt, errOut)
 		}
 		if saveErr := sess.SaveMessages(messages); saveErr != nil {
 			fmt.Fprintf(errOut, "mimicode: save messages: %v\n", saveErr)
@@ -526,6 +574,45 @@ func extractLastAssistantText(messages []provider.Message) string {
 		return strings.Join(parts, "\n")
 	}
 	return ""
+}
+
+// generateSessionName asks the model for a 3-4 word hyphenated slug relevant
+// to the user's first message. Returns fallback unchanged on any error.
+func generateSessionName(ctx context.Context, prompt, fallback string) string {
+	msgs := []provider.Message{{
+		Role:    "user",
+		Content: []provider.ContentBlock{{Type: "text", Text: prompt}},
+	}}
+	sys := "Generate a session name for this conversation. Reply with ONLY a lowercase hyphen-separated slug of 3 to 4 short words (2-5 letters each) that captures the topic. No punctuation, no explanation, nothing else. Examples: fix-auth-bug, add-dark-mode, parse-csv-rows."
+	msg, _, err := provider.CallClaude(ctx, msgs, sys, nil, provider.ModelHaiku)
+	if err != nil || len(msg.Content) == 0 {
+		return fallback
+	}
+	name := strings.TrimSpace(msg.Content[0].Text)
+	name = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || r == '-' {
+			return r
+		}
+		return -1
+	}, strings.ToLower(name))
+	name = strings.Trim(name, "-")
+	if name == "" {
+		return fallback
+	}
+	return name
+}
+
+// renameSessionOnce renames the session directory after the first turn using an
+// AI-generated name. Falls back silently to the existing hex ID on any error.
+func renameSessionOnce(ctx context.Context, sess *store.Session, prompt string, errOut io.Writer) {
+	name := generateSessionName(ctx, prompt, sess.ID)
+	if name == sess.ID {
+		return
+	}
+	if err := sess.Rename(name); err != nil {
+		return
+	}
+	fmt.Fprintf(errOut, "session: %s\n", sess.ID)
 }
 
 func rgInstallInstructions() string {

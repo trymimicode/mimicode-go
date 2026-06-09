@@ -50,7 +50,7 @@ func RunBackground(ctx context.Context, dir string) {
 	if !waitForFile(ctx, notebookPath) {
 		return // ctx cancelled before the file appeared
 	}
-	clearSnapshot(dir)
+	_ = clearSnapshot(dir)
 
 	briefer, _, _ := NewAgentBriefer("code-mimi", dir)
 	_ = Run(ctx, Config{
@@ -84,7 +84,9 @@ func Run(ctx context.Context, cfg Config) error {
 	// text (including the header we just stamped) is never treated as new input.
 	if !snapshotExists(cfg.Dir) {
 		if data, err := os.ReadFile(cfg.NotebookPath); err == nil {
-			writeSnapshot(cfg.Dir, normalizeLF(string(data)))
+			if wErr := writeSnapshot(cfg.Dir, normalizeLF(string(data))); wErr != nil {
+				fmt.Fprintf(cfg.Out, "[mimi] snapshot init failed: %v\n", wErr)
+			}
 		}
 	}
 
@@ -111,7 +113,11 @@ func Run(ctx context.Context, cfg Config) error {
 				continue // file briefly missing (e.g. atomic-save rename); retry
 			}
 			current := normalizeLF(string(raw))
-			snapshot := readSnapshot(cfg.Dir)
+			snapshot, snapErr := readSnapshot(cfg.Dir)
+			if snapErr != nil {
+				fmt.Fprintf(cfg.Out, "[mimi] snapshot read failed: %v\n", snapErr)
+				continue
+			}
 
 			if current == snapshot {
 				settled = current
@@ -125,7 +131,9 @@ func Run(ctx context.Context, cfg Config) error {
 			delta := extractNewContent(snapshot, current)
 			if strings.TrimSpace(delta) == "" {
 				// Only blank lines / whitespace changed — absorb without a turn.
-				writeSnapshot(cfg.Dir, current)
+				if wErr := writeSnapshot(cfg.Dir, current); wErr != nil {
+					fmt.Fprintf(cfg.Out, "[mimi] snapshot write failed: %v\n", wErr)
+				}
 				continue
 			}
 
@@ -135,12 +143,16 @@ func Run(ctx context.Context, cfg Config) error {
 			if briefErr != nil {
 				fmt.Fprintf(cfg.Out, "[mimi] error: %v\n", briefErr)
 				suffix, _ := appendResponse(cfg.NotebookPath, fmt.Sprintf("[mimi error: %v]", briefErr))
-				writeSnapshot(cfg.Dir, normalizeLF(current+suffix))
+				if wErr := writeSnapshot(cfg.Dir, normalizeLF(current+suffix)); wErr != nil {
+					fmt.Fprintf(cfg.Out, "[mimi] snapshot write failed: %v\n", wErr)
+				}
 				continue
 			}
 			if strings.TrimSpace(response) == "" {
 				// Nothing to say, but mark the input seen so we don't re-ask.
-				writeSnapshot(cfg.Dir, current)
+				if wErr := writeSnapshot(cfg.Dir, current); wErr != nil {
+					fmt.Fprintf(cfg.Out, "[mimi] snapshot write failed: %v\n", wErr)
+				}
 				continue
 			}
 
@@ -152,7 +164,10 @@ func Run(ctx context.Context, cfg Config) error {
 			// Extend the snapshot in memory rather than re-reading: anything the
 			// engineer typed while mimi was thinking is intentionally left out of
 			// the snapshot, so it gets picked up on the next pass instead of lost.
-			writeSnapshot(cfg.Dir, normalizeLF(current+suffix))
+			if wErr := writeSnapshot(cfg.Dir, normalizeLF(current+suffix)); wErr != nil {
+				fmt.Fprintf(cfg.Out, "[mimi] snapshot write failed: %v\n", wErr)
+				continue
+			}
 
 			fmt.Fprintf(cfg.Out, "[mimi] answered (%d bytes)\n", len(response))
 		}
