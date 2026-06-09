@@ -31,13 +31,13 @@ type Session struct {
 	Model     string    `json:"model"`
 
 	mu      sync.Mutex
-	f       *os.File // events.jsonl kept open â€” no open/close per write
+	f       *os.File // events.jsonl kept open — no open/close per write
 	start   time.Time
 	dir     string // ~/.mimi/sessions/<id>/
 	turnNum int    // incremented by LogUser
 }
 
-// â”€â”€ Event types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Event types ───────────────────────────────────────────────────────────────
 
 // CallRec is one tool_use block from a model response.
 type CallRec struct {
@@ -55,7 +55,7 @@ type TokenRec struct {
 }
 
 // ModelEvent captures a full model response: what it said + what it called + cost.
-// Text is the model's prose output before/between tool calls â€” the decision trace.
+// Text is the model's prose output before/between tool calls — the decision trace.
 type ModelEvent struct {
 	Model  string    `json:"model"`
 	Text   string    `json:"text,omitempty"`
@@ -81,7 +81,7 @@ type ToolDoneEvent struct {
 	Preview string `json:"preview,omitempty"`
 }
 
-// â”€â”€ JSONL envelope â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── JSONL envelope ────────────────────────────────────────────────────────────
 
 type entry struct {
 	T    float64 `json:"t"`
@@ -92,7 +92,7 @@ type entry struct {
 	Data any     `json:"data"`
 }
 
-// â”€â”€ Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 func New(id, cwd, model string) (*Session, error) {
 	if id == "" {
@@ -159,7 +159,22 @@ func (s *Session) Close() {
 // Path returns the session directory (all session files live here).
 func (s *Session) Path() string { return s.dir }
 
-// â”€â”€ Event logging â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Rename renames the session directory to newID and updates the session ID and
+// dir path. The open file handle inside the directory remains valid after the
+// rename on all supported platforms.
+func (s *Session) Rename(newID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	newDir := filepath.Join(sessionsDir, newID)
+	if err := os.Rename(s.dir, newDir); err != nil {
+		return fmt.Errorf("store: rename session: %w", err)
+	}
+	s.ID = newID
+	s.dir = newDir
+	return nil
+}
+
+// ── Event logging ─────────────────────────────────────────────────────────────
 
 // LogUser logs a user message and returns the turn number (1-based).
 func (s *Session) LogUser(text string) int {
@@ -213,7 +228,7 @@ func (s *Session) log(turn, step int, kind string, data any) {
 	s.f.Write([]byte("\n"))
 }
 
-// â”€â”€ Message persistence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Message persistence ───────────────────────────────────────────────────────
 
 func (s *Session) SaveMessages(messages []provider.Message) error {
 	path := filepath.Join(s.dir, "messages.json")
