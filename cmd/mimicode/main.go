@@ -161,6 +161,8 @@ func startupChecks(errOut io.Writer) error {
 	}
 	if strings.TrimSpace(getenv("ANTHROPIC_API_KEY")) == "" {
 		fmt.Fprintln(errOut, "mimicode: ANTHROPIC_API_KEY is not set")
+		fmt.Fprintln(errOut, "  set it permanently:  mimicode key --set <your-key>")
+		fmt.Fprintln(errOut, "  or for this session: export ANTHROPIC_API_KEY=<your-key>")
 		return fmt.Errorf("missing ANTHROPIC_API_KEY")
 	}
 	return nil
@@ -201,6 +203,7 @@ func runOneShot(ctx context.Context, sessionID, cwd, prompt string, in io.Reader
 		printAgentErr(errOut, err)
 		return 1
 	}
+	renameSessionOnce(ctx, sess, prompt, errOut)
 	if err := sess.SaveMessages(messages); err != nil {
 		fmt.Fprintf(errOut, "mimicode: save messages: %v\n", err)
 		return 1
@@ -312,6 +315,9 @@ func runREPL(ctx context.Context, sessionID, cwd string, in io.Reader, out, errO
 				break
 			}
 			return 1
+		}
+		if turn == 0 {
+			renameSessionOnce(ctx, sess, prompt, errOut)
 		}
 		if saveErr := sess.SaveMessages(messages); saveErr != nil {
 			fmt.Fprintf(errOut, "mimicode: save messages: %v\n", saveErr)
@@ -568,6 +574,45 @@ func extractLastAssistantText(messages []provider.Message) string {
 		return strings.Join(parts, "\n")
 	}
 	return ""
+}
+
+// generateSessionName asks the model for a 3-4 word hyphenated slug relevant
+// to the user's first message. Returns fallback unchanged on any error.
+func generateSessionName(ctx context.Context, prompt, fallback string) string {
+	msgs := []provider.Message{{
+		Role:    "user",
+		Content: []provider.ContentBlock{{Type: "text", Text: prompt}},
+	}}
+	sys := "Generate a session name for this conversation. Reply with ONLY a lowercase hyphen-separated slug of 3 to 4 short words (2-5 letters each) that captures the topic. No punctuation, no explanation, nothing else. Examples: fix-auth-bug, add-dark-mode, parse-csv-rows."
+	msg, _, err := provider.CallClaude(ctx, msgs, sys, nil, provider.ModelHaiku)
+	if err != nil || len(msg.Content) == 0 {
+		return fallback
+	}
+	name := strings.TrimSpace(msg.Content[0].Text)
+	name = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || r == '-' {
+			return r
+		}
+		return -1
+	}, strings.ToLower(name))
+	name = strings.Trim(name, "-")
+	if name == "" {
+		return fallback
+	}
+	return name
+}
+
+// renameSessionOnce renames the session directory after the first turn using an
+// AI-generated name. Falls back silently to the existing hex ID on any error.
+func renameSessionOnce(ctx context.Context, sess *store.Session, prompt string, errOut io.Writer) {
+	name := generateSessionName(ctx, prompt, sess.ID)
+	if name == sess.ID {
+		return
+	}
+	if err := sess.Rename(name); err != nil {
+		return
+	}
+	fmt.Fprintf(errOut, "session: %s\n", sess.ID)
 }
 
 func rgInstallInstructions() string {
