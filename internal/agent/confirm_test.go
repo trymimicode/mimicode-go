@@ -27,15 +27,12 @@ func writeThenStop(t *testing.T) func(context.Context, []provider.Message, strin
 }
 
 func TestConfirmGateBlocksDeniedTool(t *testing.T) {
-	old := callClaude
-	defer func() { callClaude = old }()
-	callClaude = writeThenStop(t)
-
 	cwd := t.TempDir()
 	t.Setenv("MIMICODE_COMPACT_AUTO", "0")
 	msgs, err := AgentTurn(context.Background(), AgentConfig{
 		CWD:         cwd,
 		MaxSteps:    5,
+		Provider:    funcProvider{call: writeThenStop(t)},
 		ConfirmTool: func(string, map[string]any) bool { return false },
 	}, "write it", nil)
 	if err != nil {
@@ -50,15 +47,12 @@ func TestConfirmGateBlocksDeniedTool(t *testing.T) {
 }
 
 func TestConfirmGateAllowsApprovedTool(t *testing.T) {
-	old := callClaude
-	defer func() { callClaude = old }()
-	callClaude = writeThenStop(t)
-
 	cwd := t.TempDir()
 	t.Setenv("MIMICODE_COMPACT_AUTO", "0")
 	_, err := AgentTurn(context.Background(), AgentConfig{
 		CWD:         cwd,
 		MaxSteps:    5,
+		Provider:    funcProvider{call: writeThenStop(t)},
 		ConfirmTool: func(string, map[string]any) bool { return true },
 	}, "write it", nil)
 	if err != nil {

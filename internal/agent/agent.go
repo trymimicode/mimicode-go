@@ -53,7 +53,8 @@ type AgentConfig struct {
 	MaxSteps int
 	Session  *store.Session // nil = no logging
 	StreamCB provider.StreamCallback
-	Model    string // empty = use provider.DefaultModel()
+	Model    string          // empty = use Provider.DefaultModel()
+	Provider provider.Provider // nil = provider.Claude
 	// ConfirmTool, if set, is called before each mutating tool (bash/write/edit).
 	// Returning false blocks the call. nil = no gating.
 	ConfirmTool func(name string, input map[string]any) bool
@@ -76,11 +77,6 @@ func (s AgentStuck) Error() string { return "agent stuck: " + s.Reason }
 const (
 	repeatedCallLimit = 3 // same tool+input N times → stuck
 	consecErrorLimit  = 4 // N tool errors in a row → stuck
-)
-
-var (
-	callClaude          = provider.CallClaude
-	callClaudeStreaming = provider.CallClaudeStreaming
 )
 
 var TOOLS = []provider.ToolSchema{
@@ -299,7 +295,7 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 	system := BuildSystem(cfg.CWD)
 	model := cfg.Model
 	if model == "" {
-		model = provider.DefaultModel()
+		model = cfg.Provider.DefaultModel()
 	}
 	sessionDir := ""
 	if cfg.Session != nil {
@@ -514,9 +510,9 @@ func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[s
 
 func callModel(ctx context.Context, cfg AgentConfig, messages []provider.Message, system, model string) (provider.Message, provider.Usage, error) {
 	if cfg.StreamCB != nil {
-		return callClaudeStreaming(ctx, messages, system, TOOLS, model, cfg.StreamCB)
+		return cfg.Provider.CallStreaming(ctx, messages, system, TOOLS, model, cfg.StreamCB)
 	}
-	return callClaude(ctx, messages, system, TOOLS, model)
+	return cfg.Provider.Call(ctx, messages, system, TOOLS, model)
 }
 
 func normalizeConfig(cfg AgentConfig) AgentConfig {
@@ -524,6 +520,9 @@ func normalizeConfig(cfg AgentConfig) AgentConfig {
 		if cwd, err := os.Getwd(); err == nil {
 			cfg.CWD = cwd
 		}
+	}
+	if cfg.Provider == nil {
+		cfg.Provider = provider.Claude
 	}
 	cfg.MaxSteps = maxSteps(cfg.MaxSteps)
 	return cfg

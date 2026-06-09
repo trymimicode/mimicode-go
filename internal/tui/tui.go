@@ -14,6 +14,7 @@ import (
 
 	"github.com/trymimicode/mimicode-go/internal/agent"
 	"github.com/trymimicode/mimicode-go/internal/compactor"
+	"github.com/trymimicode/mimicode-go/internal/config"
 	"github.com/trymimicode/mimicode-go/internal/provider"
 	"github.com/trymimicode/mimicode-go/internal/reflect"
 	"github.com/trymimicode/mimicode-go/internal/store"
@@ -42,7 +43,8 @@ type slashDef struct{ cmd, args, desc string }
 
 var slashDefs = []slashDef{
 	{"clear", "", "Clear the chat"},
-	{"model", "[haiku|sonnet|opus]", "Switch AI model"},
+	{"model", "[haiku|sonnet|opus]", "Switch Claude model"},
+	{"provider", "[kimi|minimax]", "Switch provider"},
 	{"usage", "", "Show token usage"},
 	{"help", "", "List commands"},
 	{"new", "", "Start a new session"},
@@ -109,8 +111,10 @@ type model struct {
 	// accumulated usage across all turns
 	totalUsage provider.Usage
 
-	// model override (set by /model command)
-	modelOverride string
+	// model/provider override (set by /model command)
+	modelOverride    string
+	providerOverride provider.Provider
+	awaitingKey      string // non-empty = collecting API key for this env var
 }
 
 var (
@@ -366,11 +370,51 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case tea.KeyEsc:
+		if m.awaitingKey != "" {
+			m.awaitingKey = ""
+			m.input = ""
+			m.cursor = 0
+			m.lines = append(m.lines, line{Kind: "error", Text: "cancelled"})
+			m.bumpCache()
+			return m, nil
+		}
 		// Dismiss slash menu
 		m.slashSuggest = nil
 		m.slashSelIdx = 0
 
 	case tea.KeyEnter:
+		// ── API key collection mode ────────────────────────────────────────
+		if m.awaitingKey != "" && !m.running {
+			key := strings.TrimSpace(m.input)
+			m.input = ""
+			m.cursor = 0
+			if key == "" {
+				m.awaitingKey = ""
+				m.lines = append(m.lines, line{Kind: "error", Text: "cancelled — no key entered"})
+				m.bumpCache()
+				return m, nil
+			}
+			if err := config.SaveKey(m.awaitingKey, key); err != nil {
+				m.lines = append(m.lines, line{Kind: "error", Text: "save key: " + err.Error()})
+				m.awaitingKey = ""
+				m.bumpCache()
+				return m, nil
+			}
+			envVar := m.awaitingKey
+			m.awaitingKey = ""
+			switch envVar {
+			case "MOONSHOT_API_KEY":
+				m.providerOverride = provider.Kimi
+				m.modelOverride = provider.Kimi.DefaultModel()
+			case "MINIMAX_API_KEY":
+				m.providerOverride = provider.MiniMax
+				m.modelOverride = provider.MiniMax.DefaultModel()
+			}
+			m.modelName = m.modelOverride
+			m.lines = append(m.lines, line{Kind: "tool", Text: "key saved · switched to " + shortModel(m.modelOverride)})
+			m.bumpCache()
+			return m, nil
+		}
 		if !m.running {
 			if m.showOnboarding {
 				m.showOnboarding = false
@@ -671,12 +715,16 @@ func (m *model) View() string {
 
 	// Input area
 	prompt := "> "
-	if m.running {
+	inputDisplay := m.input
+	if m.awaitingKey != "" {
+		prompt = "  key: "
+		inputDisplay = strings.Repeat("*", len([]rune(m.input)))
+	} else if m.running {
 		prompt = "… "
 	} else if strings.Contains(m.input, "\n") {
 		prompt = "│ "
 	}
-	inputLines := wrapInput(m.input, m.width-len(prompt)-2, m.cursor)
+	inputLines := wrapInput(inputDisplay, m.width-len(prompt)-2, m.cursor)
 	for i, ln := range inputLines {
 		if i == 0 {
 			b.WriteString(inputStyle.Render(prompt + ln))
@@ -745,6 +793,7 @@ func (m *model) submit() {
 			MaxSteps: 25,
 			StreamCB: cb,
 			Model:    m.modelName,
+			Provider: m.providerOverride,
 		}, prompt, before)
 		if m.program != nil {
 			m.program.Send(turnDoneMsg{Messages: next, Err: err, Usage: provider.LastUsage()})
@@ -1196,6 +1245,10 @@ func shortModel(model string) string {
 		return "sonnet"
 	case provider.ModelOpus:
 		return "opus"
+	case provider.Kimi.DefaultModel():
+		return "kimi"
+	case provider.MiniMax.DefaultModel():
+		return "minimax"
 	case "":
 		return "-"
 	default:
@@ -1259,6 +1312,10 @@ func (m *model) upsertChangedFile(d tools.DiffInfo) {
 
 // updateSlashSuggest recomputes slash suggestions from the current input.
 func (m *model) updateSlashSuggest() {
+	if m.awaitingKey != "" {
+		m.slashSuggest = nil
+		return
+	}
 	if !strings.HasPrefix(m.input, "/") || strings.ContainsRune(m.input, ' ') {
 		m.slashSuggest = nil
 		m.slashSelIdx = 0
@@ -1307,12 +1364,57 @@ func (m *model) executeSlash(cmd string, args []string) {
 			switch args[0] {
 			case "haiku":
 				m.modelOverride = provider.ModelHaiku
+				m.providerOverride = nil
 			case "sonnet":
 				m.modelOverride = provider.ModelSonnet
+				m.providerOverride = nil
 			case "opus":
 				m.modelOverride = provider.ModelOpus
+				m.providerOverride = nil
 			default:
 				m.lines = append(m.lines, line{Kind: "error", Text: "unknown model: " + args[0] + "  (haiku|sonnet|opus)"})
+				m.bumpCache()
+				return
+			}
+			m.modelName = m.modelOverride
+			m.lines = append(m.lines, line{Kind: "tool", Text: "switched to " + shortModel(m.modelOverride)})
+		}
+		m.bumpCache()
+
+	case "provider":
+		if len(args) == 0 {
+			cur := "claude"
+			if m.providerOverride == provider.Kimi {
+				cur = "kimi"
+			} else if m.providerOverride == provider.MiniMax {
+				cur = "minimax"
+			}
+			m.lines = append(m.lines, line{Kind: "tool",
+				Text: fmt.Sprintf("current provider: %s\nset with: /provider kimi  /provider minimax", cur)})
+		} else {
+			switch args[0] {
+			case "kimi":
+				envVar := provider.ProviderEnvVar("kimi")
+				if os.Getenv(envVar) == "" {
+					m.awaitingKey = envVar
+					m.lines = append(m.lines, line{Kind: "tool", Text: "Enter MOONSHOT_API_KEY (will be saved to config):"})
+					m.bumpCache()
+					return
+				}
+				m.providerOverride = provider.Kimi
+				m.modelOverride = provider.Kimi.DefaultModel()
+			case "minimax":
+				envVar := provider.ProviderEnvVar("minimax")
+				if os.Getenv(envVar) == "" {
+					m.awaitingKey = envVar
+					m.lines = append(m.lines, line{Kind: "tool", Text: "Enter MINIMAX_API_KEY (will be saved to config):"})
+					m.bumpCache()
+					return
+				}
+				m.providerOverride = provider.MiniMax
+				m.modelOverride = provider.MiniMax.DefaultModel()
+			default:
+				m.lines = append(m.lines, line{Kind: "error", Text: "unknown provider: " + args[0] + "  (kimi|minimax)"})
 				m.bumpCache()
 				return
 			}
