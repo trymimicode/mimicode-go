@@ -43,8 +43,9 @@ type turnDoneMsg struct {
 type tickMsg time.Time
 
 const (
-	modeChat = 0
-	modeDiff = 1
+	modeChat    = 0
+	modeDiff    = 1
+	modeSession = 2
 )
 
 type slashDef struct{ cmd, args, desc string }
@@ -56,6 +57,7 @@ var slashDefs = []slashDef{
 	{"help", "", "List commands"},
 	{"new", "", "Start a new session"},
 	{"diff", "", "Browse changed files"},
+	{"sessions", "", "Browse past sessions"},
 }
 
 type line struct {
@@ -134,6 +136,10 @@ type model struct {
 	// model override (set by /model command)
 	modelOverride string
 
+	// session browser
+	sessionList   []store.SessionSummary
+	sessionScroll int
+
 	// text selection
 	selActive bool   // mouse button held
 	selAnchor selPos // position where press began
@@ -163,6 +169,11 @@ var (
 	readDimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	streamHeadStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
 	selStyle         = lipgloss.NewStyle().Background(lipgloss.Color("24")).Foreground(lipgloss.Color("255"))
+
+	// session browser
+	sessionHeaderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("236")).Bold(true)
+	sessionRowStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("232"))
+	sessionSelStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("237")).Bold(true)
 
 	// files bar
 	fileTabStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(lipgloss.Color("234")).PaddingLeft(1).PaddingRight(1)
@@ -546,6 +557,42 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// ── Session browser mode ─────────────────────────────────────────────────
+	if m.mode == modeSession {
+		switch msg.Type {
+		case tea.KeyCtrlD:
+			return m, tea.Quit
+		case tea.KeyCtrlC, tea.KeyEsc:
+			m.mode = modeChat
+		case tea.KeyUp:
+			if m.sessionScroll > 0 {
+				m.sessionScroll--
+			}
+		case tea.KeyDown:
+			if m.sessionScroll < len(m.sessionList)-1 {
+				m.sessionScroll++
+			}
+		case tea.KeyEnter:
+			if len(m.sessionList) > 0 {
+				sel := m.sessionList[m.sessionScroll]
+				sess, msgs, err := store.ResumeOrNew(sel.ID, m.cwd, m.modelName)
+				if err == nil {
+					m.session = sess
+					m.messages = msgs
+					m.lines = renderMessages(msgs)
+				}
+				m.allToolLines = nil
+				m.changedFiles = nil
+				m.streamText = ""
+				m.totalUsage = provider.Usage{}
+				m.mode = modeChat
+				m.bumpCache()
+				m.scrollToBottom()
+			}
+		}
+		return m, nil
+	}
+
 	// ── Files bar focused ────────────────────────────────────────────────────
 	if m.fileBarFocus {
 		switch msg.Type {
@@ -852,6 +899,11 @@ func (m *model) View() string {
 	// ── Diff view mode ───────────────────────────────────────────────────────
 	if m.mode == modeDiff {
 		return m.renderDiffView()
+	}
+
+	// ── Session browser mode ─────────────────────────────────────────────────
+	if m.mode == modeSession {
+		return m.renderSessionBrowser()
 	}
 
 	// ── Chat mode ────────────────────────────────────────────────────────────
@@ -1943,6 +1995,22 @@ func (m *model) executeSlash(cmd string, args []string) {
 		m.totalUsage = provider.Usage{}
 		m.bumpCache()
 
+	case "sessions":
+		list, err := store.ListSessions()
+		if err != nil {
+			m.lines = append(m.lines, line{Kind: "error", Text: "sessions: " + err.Error()})
+			m.bumpCache()
+			return
+		}
+		if len(list) == 0 {
+			m.lines = append(m.lines, line{Kind: "tool", Text: "no sessions found"})
+			m.bumpCache()
+			return
+		}
+		m.sessionList = list
+		m.sessionScroll = 0
+		m.mode = modeSession
+
 	default:
 		m.lines = append(m.lines, line{Kind: "error", Text: "unknown command: /" + cmd + "  (type /help)"})
 		m.bumpCache()
@@ -2140,5 +2208,80 @@ func (m *model) renderOnboarding() string {
 	b.WriteString("\n\n")
 	b.WriteString(normal.Render("Press Enter to continue..."))
 	
+	return b.String()
+}
+
+// renderSessionBrowser renders the full-screen session picker.
+func (m *model) renderSessionBrowser() string {
+	var b strings.Builder
+
+	header := sessionHeaderStyle.Width(m.width).Render(" sessions   ↑/↓ scroll · Enter load · Esc back")
+	b.WriteString(header)
+	b.WriteString("\n")
+
+	bodyRows := m.height - 2 // header + footer
+	if bodyRows < 1 {
+		bodyRows = 1
+	}
+
+	// Keep selected row visible: compute scroll offset.
+	start := m.sessionScroll - bodyRows/2
+	if start < 0 {
+		start = 0
+	}
+	if start+bodyRows > len(m.sessionList) {
+		start = len(m.sessionList) - bodyRows
+		if start < 0 {
+			start = 0
+		}
+	}
+	end := start + bodyRows
+	if end > len(m.sessionList) {
+		end = len(m.sessionList)
+	}
+
+	for i := start; i < end; i++ {
+		s := m.sessionList[i]
+		date := s.StartedAt.Format("2006-01-02 15:04")
+		mod := shortModel(s.Model)
+		if mod == s.Model {
+			runes := []rune(s.Model)
+			if len(runes) > 8 {
+				mod = string(runes[:8])
+			}
+		}
+		id := s.ID
+		if len([]rune(id)) > 26 {
+			id = string([]rune(id)[:26])
+		}
+		preview := s.Preview
+		if preview == "" {
+			preview = "(no messages)"
+		}
+		preview = strings.ReplaceAll(preview, "\n", " ")
+
+		row := fmt.Sprintf(" %-26s  %s  %-6s  %s", id, date, mod, preview)
+		runes := []rune(row)
+		if len(runes) > m.width {
+			row = string(runes[:m.width-1]) + "…"
+		}
+
+		if i == m.sessionScroll {
+			b.WriteString(sessionSelStyle.Width(m.width).Render(row))
+		} else {
+			b.WriteString(sessionRowStyle.Width(m.width).Render(row))
+		}
+		b.WriteString("\n")
+	}
+
+	// Pad remaining rows so the footer lands at the bottom.
+	for rendered := end - start; rendered < bodyRows; rendered++ {
+		b.WriteString(sessionRowStyle.Width(m.width).Render(""))
+		b.WriteString("\n")
+	}
+
+	footer := fmt.Sprintf(" %d / %d", m.sessionScroll+1, len(m.sessionList))
+	b.WriteString(sessionHeaderStyle.Width(m.width).Render(footer))
+
 	return b.String()
 }
