@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 
 	"github.com/trymimicode/mimicode-go/internal/agent"
 	"github.com/trymimicode/mimicode-go/internal/compactor"
+	"github.com/trymimicode/mimicode-go/internal/recovery"
 	"github.com/trymimicode/mimicode-go/internal/provider"
 	"github.com/trymimicode/mimicode-go/internal/reflect"
 	"github.com/trymimicode/mimicode-go/internal/store"
@@ -60,6 +62,10 @@ type line struct {
 	Kind string
 	Text string
 	Diff *tools.DiffInfo
+}
+
+type selPos struct {
+	row, col int
 }
 
 // readingFile tracks the animated "reading" state for a single file.
@@ -127,6 +133,16 @@ type model struct {
 
 	// model override (set by /model command)
 	modelOverride string
+
+	// text selection
+	selActive bool   // mouse button held
+	selAnchor selPos // position where press began
+	selEnd    selPos // position of current drag
+	hasSel          bool   // a completed selection exists
+	waitingContinue bool   // true after hitting the 25-step limit
+
+	lastPrompt     string             // prompt from the most recent submit
+	beforeMessages []provider.Message // messages snapshot before the most recent submit
 }
 
 var (
@@ -146,6 +162,7 @@ var (
 	readCursorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Background(lipgloss.Color("238")).Bold(true)
 	readDimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	streamHeadStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
+	selStyle         = lipgloss.NewStyle().Background(lipgloss.Color("24")).Foreground(lipgloss.Color("255"))
 
 	// files bar
 	fileTabStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(lipgloss.Color("234")).PaddingLeft(1).PaddingRight(1)
@@ -244,7 +261,50 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.totalUsage.OutputTokens += msg.Usage.OutputTokens
 		m.currentCost = estimateCost(msg.Usage)
 		if msg.Err != nil {
-			m.lines = append(m.lines, line{Kind: "error", Text: "error: " + msg.Err.Error()})
+			stuck, isStuck := agent.IsStuck(msg.Err)
+			if isStuck && agent.IsMaxSteps(stuck) {
+				m.waitingContinue = true
+				m.lines = append(m.lines, line{Kind: "tool", Text: "hit 25-step limit — type 'y' to continue or ask something new"})
+			} else if isStuck {
+				m.lines = append(m.lines, line{Kind: "tool", Text: "retrying…"})
+				m.running = true
+				ctx, cancel := context.WithCancel(context.Background())
+				m.cancel = cancel
+				sess := m.session
+				cwd := m.cwd
+				modelName := m.modelName
+				lastPrompt := m.lastPrompt
+				beforeMsgs := m.beforeMessages
+				stuckReason := stuck.Reason
+				cb := func(eventType string, data map[string]any) {
+					if m.program != nil {
+						m.program.Send(streamMsg{Event: eventType, Data: data})
+					}
+				}
+				go func() {
+					retryPrompt := lastPrompt
+					if sess != nil {
+						if diag, err := recovery.Diagnose(ctx, sess, stuckReason); err == nil {
+							retryPrompt = lastPrompt + "\n\n[recovery] A previous attempt got stuck. Root cause: " + diag.WentWrong
+							if diag.Instruction != "" {
+								retryPrompt += " Take a different approach: " + diag.Instruction
+							}
+						}
+					}
+					next, err := agent.AgentTurn(ctx, agent.AgentConfig{
+						CWD:      cwd,
+						Session:  sess,
+						MaxSteps: 25,
+						StreamCB: cb,
+						Model:    modelName,
+					}, retryPrompt, beforeMsgs)
+					if m.program != nil {
+						m.program.Send(turnDoneMsg{Messages: next, Err: err, Usage: provider.LastUsage()})
+					}
+				}()
+			} else {
+				m.lines = append(m.lines, line{Kind: "error", Text: "error: " + msg.Err.Error()})
+			}
 		}
 		if m.session != nil {
 			_ = m.session.SaveMessages(m.messages)
@@ -278,7 +338,28 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tea.MouseMsg:
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			m.handleMouseClick(msg.X, msg.Y)
+			// start selection tracking; defer click handling until release
+			p := selPos{msg.Y + m.scroll, msg.X}
+			m.selActive = true
+			m.selAnchor = p
+			m.selEnd = p
+			m.hasSel = false
+			m.bumpCache()
+		}
+		if msg.Action == tea.MouseActionMotion && m.selActive {
+			m.selEnd = selPos{msg.Y + m.scroll, msg.X}
+			m.hasSel = m.selEnd != m.selAnchor
+			m.bumpCache()
+		}
+		if msg.Action == tea.MouseActionRelease && msg.Button == tea.MouseButtonLeft {
+			m.selActive = false
+			if !m.hasSel {
+				// plain click — fire existing click logic
+				m.handleMouseClick(msg.X, msg.Y)
+			} else {
+				m.copySelectionToClipboard()
+			}
+			m.bumpCache()
 		}
 		if msg.Button == tea.MouseButtonWheelUp {
 			if m.mode == modeDiff {
@@ -362,7 +443,67 @@ func (m *model) openFileInDiff(rel string) {
 	m.diffScroll = 0
 }
 
+func (m *model) copySelectionToClipboard() {
+	rendered := m.renderedLines()
+	lo, hi := m.selAnchor, m.selEnd
+	if lo.row > hi.row || (lo.row == hi.row && lo.col > hi.col) {
+		lo, hi = hi, lo
+	}
+	if lo.row < 0 {
+		lo.row = 0
+	}
+	if hi.row >= len(rendered) {
+		hi.row = len(rendered) - 1
+	}
+	var lines []string
+	for i := lo.row; i <= hi.row; i++ {
+		plain := ansiEscRe.ReplaceAllString(rendered[i], "")
+		runes := []rune(plain)
+		n := len(runes)
+		startCol, endCol := 0, n
+		if i == lo.row {
+			startCol = lo.col
+		}
+		if i == hi.row {
+			endCol = hi.col
+		}
+		if startCol > n {
+			startCol = n
+		}
+		if endCol > n {
+			endCol = n
+		}
+		lines = append(lines, string(runes[startCol:endCol]))
+	}
+	text := strings.Join(lines, "\n")
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	case "windows":
+		cmd = exec.Command("clip")
+	default:
+		cmd = exec.Command("xclip", "-selection", "clipboard")
+	}
+	cmd.Stdin = strings.NewReader(text)
+	_ = cmd.Run()
+}
+
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Ctrl+C with an active selection copies instead of quitting.
+	if msg.Type == tea.KeyCtrlC && m.hasSel {
+		m.copySelectionToClipboard()
+		m.hasSel = false
+		m.selActive = false
+		m.bumpCache()
+		return m, nil
+	}
+	// Any key clears an existing text selection.
+	if m.hasSel || m.selActive {
+		m.hasSel = false
+		m.selActive = false
+		m.bumpCache()
+	}
 	// ── Diff view mode ───────────────────────────────────────────────────────
 	if m.mode == modeDiff {
 		switch msg.Type {
@@ -723,8 +864,35 @@ func (m *model) View() string {
 	if end > len(rendered) {
 		end = len(rendered)
 	}
+	selLo, selHi := m.selAnchor, m.selEnd
+	if selLo.row > selHi.row || (selLo.row == selHi.row && selLo.col > selHi.col) {
+		selLo, selHi = selHi, selLo
+	}
 	for i := m.scroll; i < end; i++ {
-		b.WriteString(rendered[i])
+		if (m.hasSel || m.selActive) && i >= selLo.row && i <= selHi.row {
+			plain := ansiEscRe.ReplaceAllString(rendered[i], "")
+			runes := []rune(plain)
+			n := len(runes)
+			startCol, endCol := 0, n
+			if i == selLo.row {
+				startCol = selLo.col
+			}
+			if i == selHi.row {
+				endCol = selHi.col
+			}
+			if startCol > n {
+				startCol = n
+			}
+			if endCol > n {
+				endCol = n
+			}
+			before := string(runes[:startCol])
+			sel := string(runes[startCol:endCol])
+			after := string(runes[endCol:])
+			b.WriteString(before + selStyle.Render(sel) + after)
+		} else {
+			b.WriteString(rendered[i])
+		}
 		b.WriteString("\n")
 	}
 	for i := end - m.scroll; i < rows; i++ {
@@ -800,6 +968,12 @@ func (m *model) submit() {
 	if prompt == "" {
 		return
 	}
+	if m.waitingContinue {
+		m.waitingContinue = false
+		if strings.ToLower(prompt) == "y" || strings.ToLower(prompt) == "yes" {
+			prompt = "continue"
+		}
+	}
 	
 	// Add to history
 	m.history = append(m.history, m.input)
@@ -836,9 +1010,11 @@ func (m *model) submit() {
 	m.bumpCache()
 	m.scrollToBottom()
 
+	m.lastPrompt = prompt
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	before := append([]provider.Message(nil), m.messages[:len(m.messages)-1]...)
+	m.beforeMessages = before
 	cb := func(eventType string, data map[string]any) {
 		if m.program != nil {
 			m.program.Send(streamMsg{Event: eventType, Data: data})
