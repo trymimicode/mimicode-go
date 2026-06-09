@@ -91,7 +91,7 @@ func TestAgentTurnToolLoopThenFinalResponse(t *testing.T) {
 func TestBuildSystemPersonaAndCacheBreak(t *testing.T) {
 	cwd := t.TempDir()
 
-	claude := BuildSystem(cwd, provider.Claude)
+	claude := BuildSystem(cwd, provider.Claude, "")
 	if !strings.Contains(claude, provider.SystemCacheBreak) {
 		t.Fatal("BuildSystem must embed the cache-break marker between persona and context")
 	}
@@ -110,14 +110,14 @@ func TestBuildSystemPersonaAndCacheBreak(t *testing.T) {
 	}
 
 	// A non-Claude provider gets the compat persona with explicit tool formatting.
-	compat := BuildSystem(cwd, provider.Kimi)
+	compat := BuildSystem(cwd, provider.Kimi, "")
 	cp, _, _ := strings.Cut(compat, provider.SystemCacheBreak)
 	if !strings.Contains(cp, "Tool-call format") {
 		t.Error("non-Claude persona must include the tool-format guide")
 	}
 
 	// nil provider defaults to Claude.
-	if got := BuildSystem(cwd, nil); !strings.HasPrefix(got, SYSTEM_PROMPT) {
+	if got := BuildSystem(cwd, nil, ""); !strings.HasPrefix(got, SYSTEM_PROMPT) {
 		t.Error("nil provider should default to the Claude persona")
 	}
 }

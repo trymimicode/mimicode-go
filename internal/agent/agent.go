@@ -265,12 +265,20 @@ func personaFor(p provider.Provider) string {
 	return SYSTEM_PROMPT_COMPAT
 }
 
+// memoryBudget caps how many bytes of MEMORY.md enter the system prompt. The
+// file grows without bound, so beyond this we inject only the entries most
+// relevant to the current prompt (see memory.SelectMemory).
+const memoryBudget = 6000
+
 // BuildSystem assembles the system prompt as two parts joined by
 // provider.SystemCacheBreak: the static persona (cacheable across every turn)
 // and the volatile per-turn context (env, project instructions, repomap, rules,
 // memory). The Claude builder turns the marker into separate cache breakpoints
 // so a repomap refresh or a new rule no longer busts the persona cache.
-func BuildSystem(cwd string, p provider.Provider) string {
+//
+// recentPrompt is the latest user message; it gates which memory entries are
+// injected so an ever-growing MEMORY.md doesn't bloat every turn.
+func BuildSystem(cwd string, p provider.Provider, recentPrompt string) string {
 	var b strings.Builder
 	b.WriteString(personaFor(p))
 
@@ -289,7 +297,7 @@ func BuildSystem(cwd string, p provider.Provider) string {
 	if rules := memory.LoadAllRules(cwd); rules != "" {
 		fmt.Fprintf(&b, "\n\n## Behavioral rules\n%s", rules)
 	}
-	if mem := memory.LoadMemory(cwd); mem != "" {
+	if mem := memory.SelectMemory(cwd, recentPrompt, memoryBudget); mem != "" {
 		fmt.Fprintf(&b, "\n\n## Memory\n%s", mem)
 	}
 	return b.String()
@@ -335,7 +343,7 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 		Content: []provider.ContentBlock{{Type: "text", Text: userMsg}},
 	})
 
-	system := BuildSystem(cfg.CWD, cfg.Provider)
+	system := BuildSystem(cfg.CWD, cfg.Provider, userMsg)
 	model := cfg.Model
 	if model == "" {
 		model = cfg.Provider.DefaultModel()
