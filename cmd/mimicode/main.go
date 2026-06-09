@@ -161,6 +161,8 @@ func startupChecks(errOut io.Writer) error {
 	}
 	if strings.TrimSpace(getenv("ANTHROPIC_API_KEY")) == "" {
 		fmt.Fprintln(errOut, "mimicode: ANTHROPIC_API_KEY is not set")
+		fmt.Fprintln(errOut, "  set it permanently:  mimicode key --set <your-key>")
+		fmt.Fprintln(errOut, "  or for this session: export ANTHROPIC_API_KEY=<your-key>")
 		return fmt.Errorf("missing ANTHROPIC_API_KEY")
 	}
 	return nil
