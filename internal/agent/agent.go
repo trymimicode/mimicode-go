@@ -51,12 +51,37 @@ Tools: read, bash, edit, write, memory_write, memory_search, web_search, web_fet
 
 Output: minimal. No filler. No "Great question". Reference code as file:line. Don't paste diffs. Don't create .md summaries.`
 
+// toolFormatGuide is appended to the persona for non-Claude providers (Kimi,
+// MiniMax, GLM, etc.). These models are far more sensitive to tool-call shape
+// than Claude — they routinely stringify array arguments or describe a call in
+// prose instead of emitting it. Spelling out the exact format with one concrete
+// example per mutating tool measurably improves compliance. Claude does not need
+// this, so it only ships in the compat persona.
+const toolFormatGuide = `## Tool-call format — follow exactly
+Emit every tool call as a structured tool_use. Never describe a call in prose, never wrap arguments in markdown, never send arguments as a quoted/stringified blob — they must be a real JSON object.
+
+- edit — "edits" is a JSON ARRAY of objects, not a string:
+  {"path":"main.go","edits":[{"old_text":"foo()","new_text":"bar()"}]}
+- write — full file content in "content":
+  {"path":"notes.md","content":"line one\nline two\n"}
+- bash — one command in "cmd":
+  {"cmd":"go test ./..."}
+
+Make one tool call at a time unless the calls are independent. After an edit or write, verify with bash. Never repeat a call that already succeeded.`
+
+// SYSTEM_PROMPT_COMPAT is the persona for weaker, format-sensitive providers. It
+// keeps the identical rubber-duck persona and only adds explicit tool-call
+// formatting guidance — the product behavior is unchanged, the model just gets
+// the extra scaffolding it needs to call tools correctly.
+const SYSTEM_PROMPT_COMPAT = SYSTEM_PROMPT + "\n\n" + toolFormatGuide
+
 type AgentConfig struct {
 	CWD      string
 	MaxSteps int
 	Session  *store.Session // nil = no logging
 	StreamCB provider.StreamCallback
-	Model    string // empty = use provider.DefaultModel()
+	Model    string            // empty = use Provider.DefaultModel()
+	Provider provider.Provider // nil = provider.Claude
 	// ConfirmTool, if set, is called before each mutating tool (bash/write/edit).
 	// Returning false blocks the call. nil = no gating.
 	ConfirmTool func(name string, input map[string]any) bool
@@ -82,11 +107,6 @@ func (s AgentStuck) Error() string { return "agent stuck: " + s.Reason }
 const (
 	repeatedCallLimit = 3 // same tool+input N times → stuck
 	consecErrorLimit  = 4 // N tool errors in a row → stuck
-)
-
-var (
-	callClaude          = provider.CallClaude
-	callClaudeStreaming = provider.CallClaudeStreaming
 )
 
 var TOOLS = []provider.ToolSchema{
@@ -240,10 +260,37 @@ var TOOLS = []provider.ToolSchema{
 	},
 }
 
-func BuildSystem(cwd string) string {
+// personaFor returns the static persona for a provider. The real Anthropic
+// endpoint gets the lean prompt; every other backend (Kimi, MiniMax, GLM, …)
+// gets the compat persona with explicit tool-call formatting. The result is a
+// pure constant per provider, so it stays a stable, cacheable prefix.
+func personaFor(p provider.Provider) string {
+	if p == nil || p == provider.Claude {
+		return SYSTEM_PROMPT
+	}
+	return SYSTEM_PROMPT_COMPAT
+}
+
+// memoryBudget caps how many bytes of MEMORY.md enter the system prompt. The
+// file grows without bound, so beyond this we inject only the entries most
+// relevant to the current prompt (see memory.SelectMemory).
+const memoryBudget = 6000
+
+// BuildSystem assembles the system prompt as two parts joined by
+// provider.SystemCacheBreak: the static persona (cacheable across every turn)
+// and the volatile per-turn context (env, project instructions, repomap, rules,
+// memory). The Claude builder turns the marker into separate cache breakpoints
+// so a repomap refresh or a new rule no longer busts the persona cache.
+//
+// recentPrompt is the latest user message; it gates which memory entries are
+// injected so an ever-growing MEMORY.md doesn't bloat every turn.
+func BuildSystem(cwd string, p provider.Provider, recentPrompt string) string {
 	var b strings.Builder
-	b.WriteString(SYSTEM_PROMPT)
-	fmt.Fprintf(&b, "\n\nCurrent date: %s", time.Now().Format("2006-01-02"))
+	b.WriteString(personaFor(p))
+
+	// Everything below is volatile and goes after the cache break.
+	b.WriteString(provider.SystemCacheBreak)
+	fmt.Fprintf(&b, "Current date: %s", time.Now().Format("2006-01-02"))
 	fmt.Fprintf(&b, "\nCurrent working directory: %s", cwd)
 
 	if path, content := loadProjectContext(cwd); content != "" {
@@ -253,10 +300,10 @@ func BuildSystem(cwd string) string {
 	if repo := repomap.Cached(); repo != "" {
 		fmt.Fprintf(&b, "\n\n## Repository map\n%s", repo)
 	}
-	if rules := memory.LoadRules(cwd); rules != "" {
+	if rules := memory.LoadAllRules(cwd); rules != "" {
 		fmt.Fprintf(&b, "\n\n## Behavioral rules\n%s", rules)
 	}
-	if mem := memory.LoadMemory(cwd); mem != "" {
+	if mem := memory.SelectMemory(cwd, recentPrompt, memoryBudget); mem != "" {
 		fmt.Fprintf(&b, "\n\n## Memory\n%s", mem)
 	}
 	return b.String()
@@ -302,13 +349,13 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 		Content: []provider.ContentBlock{{Type: "text", Text: userMsg}},
 	})
 
-	system := BuildSystem(cfg.CWD)
+	system := BuildSystem(cfg.CWD, cfg.Provider, userMsg)
 	if cfg.Force {
 		system += FORCE_ADDENDUM
 	}
 	model := cfg.Model
 	if model == "" {
-		model = provider.DefaultModel()
+		model = cfg.Provider.DefaultModel()
 	}
 	sessionDir := ""
 	if cfg.Session != nil {
@@ -523,9 +570,9 @@ func dispatchTool(ctx context.Context, cfg AgentConfig, name string, input map[s
 
 func callModel(ctx context.Context, cfg AgentConfig, messages []provider.Message, system, model string) (provider.Message, provider.Usage, error) {
 	if cfg.StreamCB != nil {
-		return callClaudeStreaming(ctx, messages, system, TOOLS, model, cfg.StreamCB)
+		return cfg.Provider.CallStreaming(ctx, messages, system, TOOLS, model, cfg.StreamCB)
 	}
-	return callClaude(ctx, messages, system, TOOLS, model)
+	return cfg.Provider.Call(ctx, messages, system, TOOLS, model)
 }
 
 func normalizeConfig(cfg AgentConfig) AgentConfig {
@@ -533,6 +580,9 @@ func normalizeConfig(cfg AgentConfig) AgentConfig {
 		if cwd, err := os.Getwd(); err == nil {
 			cfg.CWD = cwd
 		}
+	}
+	if cfg.Provider == nil {
+		cfg.Provider = provider.Claude
 	}
 	cfg.MaxSteps = maxSteps(cfg.MaxSteps)
 	return cfg

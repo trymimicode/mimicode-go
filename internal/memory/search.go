@@ -39,56 +39,152 @@ tokenize='unicode61 remove_diacritics 2'
 		return nil, err
 	}
 
+	// idx_state tracks the mtime of each indexed source so reindex can touch only
+	// what changed instead of rebuilding the whole corpus on every search.
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS idx_state(
+key TEXT PRIMARY KEY, mtime INTEGER
+)`); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	return db, nil
 }
 
+// indexSource is one indexable item (a session transcript or a memory file).
+type indexSource struct {
+	key      string // unique: "<kind>/<sourceID>"
+	kind     string
+	sourceID string
+	mtime    int64
+	load     func() (text, scope string, err error)
+}
+
+// gatherSources lists every source that should be in the index, with its mtime
+// and a lazy loader so unchanged sources are never re-read.
+func gatherSources(sessionsDir, memoryRoot string) ([]indexSource, error) {
+	var sources []indexSource
+
+	sessionPaths, err := filepath.Glob(filepath.Join(sessionsDir, "*.messages.json"))
+	if err != nil {
+		return nil, err
+	}
+	for _, path := range sessionPaths {
+		fi, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		sourceID := strings.TrimSuffix(filepath.Base(path), ".messages.json")
+		path := path
+		sources = append(sources, indexSource{
+			key:      "session/" + sourceID,
+			kind:     "session",
+			sourceID: sourceID,
+			mtime:    fi.ModTime().UnixNano(),
+			load:     func() (string, string, error) { return sessionSearchText(path) },
+		})
+	}
+
+	for _, item := range []struct{ name, kind string }{
+		{"MEMORY.md", "memory"},
+		{"RULES.md", "rules"},
+	} {
+		path := filepath.Join(memoryRoot, item.name)
+		fi, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		item, path := item, path
+		sources = append(sources, indexSource{
+			key:      item.kind + "/" + item.name,
+			kind:     item.kind,
+			sourceID: item.name,
+			mtime:    fi.ModTime().UnixNano(),
+			load: func() (string, string, error) {
+				data, err := os.ReadFile(path)
+				return string(data), "", err
+			},
+		})
+	}
+
+	return sources, nil
+}
+
+// reindex brings the FTS table up to date incrementally: it re-reads only
+// sources whose mtime changed (or are new) and drops sources whose files are
+// gone. Within a session, searching repeatedly no longer re-parses every
+// transcript on disk.
 func reindex(db *sql.DB, sessionsDir, memoryRoot string) error {
+	sources, err := gatherSources(sessionsDir, memoryRoot)
+	if err != nil {
+		return err
+	}
+
+	state := map[string]int64{}
+	rows, err := db.Query("SELECT key, mtime FROM idx_state")
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var key string
+		var mtime int64
+		if err := rows.Scan(&key, &mtime); err != nil {
+			rows.Close()
+			return err
+		}
+		state[key] = mtime
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if _, err := tx.Exec("DELETE FROM memory"); err != nil {
-		return err
-	}
-
-	sessionPaths, err := filepath.Glob(filepath.Join(sessionsDir, "*.messages.json"))
-	if err != nil {
-		return err
-	}
-	for _, path := range sessionPaths {
-		text, scope, err := sessionSearchText(path)
+	desired := make(map[string]bool, len(sources))
+	for _, s := range sources {
+		desired[s.key] = true
+		if old, ok := state[s.key]; ok && old == s.mtime {
+			continue // unchanged since last index
+		}
+		text, scope, err := s.load()
 		if err != nil {
 			return err
 		}
-		sourceID := strings.TrimSuffix(filepath.Base(path), ".messages.json")
+		if _, err := tx.Exec("DELETE FROM memory WHERE kind = ? AND source_id = ?", s.kind, s.sourceID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(
 			"INSERT INTO memory(kind, source_id, text, file_scope) VALUES(?, ?, ?, ?)",
-			"session", sourceID, text, scope,
+			s.kind, s.sourceID, text, scope,
+		); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			"INSERT INTO idx_state(key, mtime) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET mtime = excluded.mtime",
+			s.key, s.mtime,
 		); err != nil {
 			return err
 		}
 	}
 
-	for _, item := range []struct {
-		name string
-		kind string
-	}{
-		{name: "MEMORY.md", kind: "memory"},
-		{name: "RULES.md", kind: "rules"},
-	} {
-		data, err := os.ReadFile(filepath.Join(memoryRoot, item.name))
-		if errors.Is(err, os.ErrNotExist) {
+	// Drop sources whose files no longer exist.
+	for key := range state {
+		if desired[key] {
 			continue
 		}
-		if err != nil {
+		kind, sourceID, _ := strings.Cut(key, "/")
+		if _, err := tx.Exec("DELETE FROM memory WHERE kind = ? AND source_id = ?", kind, sourceID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(
-			"INSERT INTO memory(kind, source_id, text, file_scope) VALUES(?, ?, ?, ?)",
-			item.kind, item.name, string(data), "",
-		); err != nil {
+		if _, err := tx.Exec("DELETE FROM idx_state WHERE key = ?", key); err != nil {
 			return err
 		}
 	}

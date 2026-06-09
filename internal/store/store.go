@@ -151,6 +151,13 @@ func summarizeSession(dir, id string) SessionSummary {
 		case "session_start":
 			s.Model, _ = m["model"].(string)
 			s.CWD, _ = m["cwd"].(string)
+			if ts, ok := m["started_at"].(float64); ok {
+				s.StartedAt = time.Unix(int64(ts), 0)
+			}
+		case "model":
+			if modelStr, ok := m["model"].(string); ok && modelStr != "" {
+				s.Model = modelStr
+			}
 		case "user":
 			if s.Preview == "" {
 				text, _ := m["text"].(string)
@@ -167,6 +174,21 @@ func summarizeSession(dir, id string) SessionSummary {
 		}
 	}
 	return s
+}
+
+// AvailableSlug returns base if no session with that name exists, otherwise
+// appends -2, -3, … until a free name is found.
+func AvailableSlug(base string) string {
+	if _, err := os.Stat(filepath.Join(sessionsDir, base)); os.IsNotExist(err) {
+		return base
+	}
+	for i := 2; i <= 99; i++ {
+		candidate := fmt.Sprintf("%s-%d", base, i)
+		if _, err := os.Stat(filepath.Join(sessionsDir, candidate)); os.IsNotExist(err) {
+			return candidate
+		}
+	}
+	return base
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -191,7 +213,7 @@ func New(id, cwd, model string) (*Session, error) {
 		ID: id, CWD: cwd, StartedAt: time.Now(), Model: model,
 		f: f, start: time.Now(), dir: dir,
 	}
-	s.log(0, 0, "session_start", map[string]any{"cwd": cwd, "model": model})
+	s.log(0, 0, "session_start", map[string]any{"cwd": cwd, "model": model, "started_at": time.Now().Unix()})
 	return s, nil
 }
 

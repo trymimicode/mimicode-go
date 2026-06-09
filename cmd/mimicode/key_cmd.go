@@ -1,72 +1,23 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
+
+	"github.com/trymimicode/mimicode-go/internal/config"
 )
 
-type mimicodeConfig struct {
-	AnthropicAPIKey string `json:"anthropic_api_key,omitempty"`
-}
+// mimicodeConfig is kept as an alias so existing call-sites compile unchanged.
+type mimicodeConfig = config.Config
 
-func configFilePath() (string, error) {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "mimicode", "config.json"), nil
-}
+func configFilePath() (string, error) { return config.FilePath() }
+func loadConfig() (config.Config, error) { return config.Load() }
+func saveConfig(cfg config.Config) error { return config.Save(cfg) }
 
-func loadConfig() (mimicodeConfig, error) {
-	path, err := configFilePath()
-	if err != nil {
-		return mimicodeConfig{}, err
-	}
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return mimicodeConfig{}, nil
-	}
-	if err != nil {
-		return mimicodeConfig{}, err
-	}
-	// Strip UTF-8 BOM if present (written by some editors/tools on Windows).
-	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
-	var cfg mimicodeConfig
-	return cfg, json.Unmarshal(data, &cfg)
-}
-
-func saveConfig(cfg mimicodeConfig) error {
-	path, err := configFilePath()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0600)
-}
-
-// applyStoredKey sets ANTHROPIC_API_KEY from the config file if the env var is not already set.
-func applyStoredKey() {
-	if getenv("ANTHROPIC_API_KEY") != "" {
-		return
-	}
-	cfg, err := loadConfig()
-	if err != nil || cfg.AnthropicAPIKey == "" {
-		return
-	}
-	_ = setenv("ANTHROPIC_API_KEY", strings.TrimSpace(cfg.AnthropicAPIKey))
-}
+// applyStoredKey sets all provider env vars from the config file.
+func applyStoredKey() { config.ApplyAll() }
 
 func runKeyCmd(args []string, out, errOut io.Writer) int {
 	fs := flag.NewFlagSet("mimicode key", flag.ContinueOnError)

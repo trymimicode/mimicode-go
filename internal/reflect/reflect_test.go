@@ -37,6 +37,8 @@ func TestReflectWritesSummaryAndRules(t *testing.T) {
 	}
 
 	cwd := t.TempDir()
+	configDir := t.TempDir()
+	t.Setenv("MIMICODE_CONFIG_DIR", configDir)
 	sess := newSession(t, "reflect-1", cwd, `{"kind":"tool_exec","data":{"name":"bash"}}`+"\n")
 
 	if err := RunReflect(context.Background(), sess, cwd); err != nil {
@@ -47,9 +49,13 @@ func TestReflectWritesSummaryAndRules(t *testing.T) {
 	if !strings.Contains(string(mem), "prod-ready") {
 		t.Fatalf("MEMORY.md missing summary: %q", mem)
 	}
-	rules, _ := os.ReadFile(filepath.Join(cwd, ".mimi", "RULES.md"))
+	// Reflect rules are behavioral — they go to the user-level (global) RULES.md.
+	rules, _ := os.ReadFile(filepath.Join(configDir, "RULES.md"))
 	if !strings.Contains(string(rules), "grep exits non-zero") {
-		t.Fatalf("RULES.md missing rule: %q", rules)
+		t.Fatalf("global RULES.md missing rule: %q", rules)
+	}
+	if _, err := os.Stat(filepath.Join(cwd, ".mimi", "RULES.md")); !os.IsNotExist(err) {
+		t.Fatal("reflect rules must not be written to the project .mimi/RULES.md")
 	}
 }
 
@@ -63,6 +69,7 @@ func TestReflectSkipsSessionsWithoutToolActivity(t *testing.T) {
 	}
 
 	cwd := t.TempDir()
+	t.Setenv("MIMICODE_CONFIG_DIR", t.TempDir())
 	// Pure chat: a user message and a model reply, but no tool_exec.
 	events := `{"kind":"user","data":{"text":"hi"}}` + "\n" + `{"kind":"model","data":{"text":"hello"}}` + "\n"
 	sess := newSession(t, "reflect-2", cwd, events)
@@ -88,6 +95,7 @@ func TestReflectNoRulesWhenModelReturnsEmpty(t *testing.T) {
 	}
 
 	cwd := t.TempDir()
+	t.Setenv("MIMICODE_CONFIG_DIR", t.TempDir())
 	sess := newSession(t, "reflect-3", cwd, `{"kind":"tool_exec","data":{"name":"read"}}`+"\n")
 
 	if err := RunReflect(context.Background(), sess, cwd); err != nil {

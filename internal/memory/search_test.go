@@ -77,6 +77,47 @@ func TestSearchIndexesSessionsAndMemory(t *testing.T) {
 	}
 }
 
+// TestSearchIncrementalPicksUpNewSession verifies the incremental index sees a
+// session added between two searches (the index isn't a one-shot build).
+func TestSearchIncrementalPicksUpNewSession(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	sessionsDir := filepath.Join(home, ".mimi", "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+
+	writeSession(t, filepath.Join(sessionsDir, "alpha.messages.json"), []map[string]any{
+		{"role": "user", "content": []map[string]any{{"type": "text", "text": "talk about widgets"}}},
+	})
+
+	if _, err := Search("widgets", 5, "", cwd); err != nil {
+		t.Fatalf("first search: %v", err)
+	}
+
+	// Add a second session after the index already exists.
+	writeSession(t, filepath.Join(sessionsDir, "beta.messages.json"), []map[string]any{
+		{"role": "user", "content": []map[string]any{{"type": "text", "text": "investigate the gizmo subsystem"}}},
+	})
+
+	results, err := Search("gizmo", 5, "", cwd)
+	if err != nil {
+		t.Fatalf("second search: %v", err)
+	}
+	var found bool
+	for _, r := range results {
+		if r.SourceID == "beta" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("incremental index missed the newly added session, got %#v", results)
+	}
+}
+
 func writeSession(t *testing.T, path string, messages []map[string]any) {
 	t.Helper()
 
