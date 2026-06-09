@@ -45,7 +45,13 @@ jobs:
         
         # macOS arm64
         GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o mimicode-darwin-arm64 ./cmd/mimicode
-        
+
+        # Windows amd64
+        GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o mimicode-windows-amd64.exe ./cmd/mimicode
+
+        # Windows arm64
+        GOOS=windows GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o mimicode-windows-arm64.exe ./cmd/mimicode
+
         # Create checksums
         sha256sum mimicode-* > checksums.txt
 
@@ -57,6 +63,8 @@ jobs:
           mimicode-linux-arm64
           mimicode-darwin-amd64
           mimicode-darwin-arm64
+          mimicode-windows-amd64.exe
+          mimicode-windows-arm64.exe
           checksums.txt
         body: |
           ## Installation
@@ -71,8 +79,14 @@ jobs:
           - Linux ARM64: `mimicode-linux-arm64`
           - macOS x86_64: `mimicode-darwin-amd64`
           - macOS ARM64 (M1/M2): `mimicode-darwin-arm64`
+          - Windows x86_64: `mimicode-windows-amd64.exe`
+          - Windows ARM64: `mimicode-windows-arm64.exe`
 
-          Download, rename to `mimicode`, make executable (`chmod +x mimicode`), and move to your PATH.
+          On macOS/Linux: download, rename to `mimicode`, make executable
+          (`chmod +x mimicode`), and move to your PATH. On Windows, install with:
+          ```powershell
+          irm https://raw.githubusercontent.com/trymimicode/mimicode-go/main/install.ps1 | iex
+          ```
 
           ## What's Changed
           See commits for details.

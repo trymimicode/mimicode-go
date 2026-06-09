@@ -1,124 +1,132 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-# mimicode installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/trymimicode/mimicode-go/main/install.sh | bash
+# mimicode installer (macOS & Linux)
+#
+# Downloads a prebuilt mimicode binary (no Go toolchain required) and installs
+# it to ~/.local/bin, then adds that directory to your PATH via the correct
+# profile file for your shell (zsh, bash, or fish).
+#
+# Quick install:
+#   curl -fsSL https://raw.githubusercontent.com/trymimicode/mimicode-go/main/install.sh | bash
+#
+# Overrides:
+#   INSTALL_DIR=$HOME/bin   ...   install location (default: ~/.local/bin)
+#   MIMICODE_BASE_URL=...         release download base (used by CI tests)
 
 REPO="trymimicode/mimicode-go"
 BINARY_NAME="mimicode"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+BASE_URL="${MIMICODE_BASE_URL:-https://github.com/$REPO/releases/latest/download}"
 
 echo "🚀 Installing mimicode..."
 
-# Detect OS and architecture
+# ── Detect OS / architecture ─────────────────────────────────────────────────
 OS="$(uname -s)"
 ARCH="$(uname -m)"
-
 case "$OS" in
     Linux)  OS="linux" ;;
     Darwin) OS="darwin" ;;
     *)      echo "❌ Unsupported OS: $OS"; exit 1 ;;
 esac
-
 case "$ARCH" in
-    x86_64)  ARCH="amd64" ;;
+    x86_64)        ARCH="amd64" ;;
     aarch64|arm64) ARCH="arm64" ;;
-    *)       echo "❌ Unsupported architecture: $ARCH"; exit 1 ;;
+    *)             echo "❌ Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-# Try downloading pre-built binary from latest release
+# ── Download the prebuilt binary ─────────────────────────────────────────────
 BINARY_FILE="$BINARY_NAME-$OS-$ARCH"
-DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$BINARY_FILE"
+DOWNLOAD_URL="$BASE_URL/$BINARY_FILE"
+TMP_BIN="$(mktemp)"
+trap 'rm -f "$TMP_BIN"' EXIT
 
-echo "  Trying to download pre-built binary..."
+echo "  Downloading $BINARY_FILE..."
 if command -v curl >/dev/null 2>&1; then
-    HTTP_CODE=$(curl -L -w "%{http_code}" -o "/tmp/$BINARY_FILE" "$DOWNLOAD_URL" 2>/dev/null || echo "000")
-    if [ "$HTTP_CODE" = "200" ]; then
-        echo "✓ Downloaded pre-built binary"
-        mkdir -p "$INSTALL_DIR"
-        mv "/tmp/$BINARY_FILE" "$INSTALL_DIR/$BINARY_NAME"
-        chmod +x "$INSTALL_DIR/$BINARY_NAME"
-        echo "✓ $BINARY_NAME installed to $INSTALL_DIR/$BINARY_NAME"
-        INSTALLED=1
-    else
-        echo "  No pre-built binary available (HTTP $HTTP_CODE)"
-        rm -f "/tmp/$BINARY_FILE"
-    fi
+    HTTP_CODE="$(curl -fL -w '%{http_code}' -o "$TMP_BIN" "$DOWNLOAD_URL" 2>/dev/null || echo 000)"
+elif command -v wget >/dev/null 2>&1; then
+    if wget -qO "$TMP_BIN" "$DOWNLOAD_URL"; then HTTP_CODE="200"; else HTTP_CODE="000"; fi
+else
+    echo "❌ Need curl or wget to download mimicode."; exit 1
 fi
 
-# Fall back to building from source if download failed
-if [ -z "$INSTALLED" ]; then
-    if command -v go >/dev/null 2>&1; then
-        echo "✓ Go detected, building from source..."
-        
-        # Create temp directory
-        TMP_DIR=$(mktemp -d)
-        trap "rm -rf $TMP_DIR" EXIT
-        
-        cd "$TMP_DIR"
-        echo "  Cloning repository..."
-        git clone --depth 1 "https://github.com/$REPO.git" .
-        
-        echo "  Building binary..."
-        go build -o "$BINARY_NAME" -ldflags="-s -w" ./cmd/mimicode
-        
-        # Create install directory if it doesn't exist
-        mkdir -p "$INSTALL_DIR"
-        
-        # Install binary
-        mv "$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
-        chmod +x "$INSTALL_DIR/$BINARY_NAME"
-        
-        echo "✓ $BINARY_NAME installed to $INSTALL_DIR/$BINARY_NAME"
-    else
-        echo "❌ Could not download pre-built binary and Go is not installed."
-        echo "   Install Go 1.26+ from https://go.dev/dl/ or download manually:"
-        echo "   https://github.com/$REPO/releases"
-        exit 1
-    fi
+if [ "$HTTP_CODE" != "200" ] || [ ! -s "$TMP_BIN" ]; then
+    echo "❌ Could not download a prebuilt binary for $OS/$ARCH (HTTP $HTTP_CODE)."
+    echo "   Check available downloads at https://github.com/$REPO/releases"
+    exit 1
 fi
 
-# Verify installation
+# ── Install ──────────────────────────────────────────────────────────────────
+mkdir -p "$INSTALL_DIR"
+mv -f "$TMP_BIN" "$INSTALL_DIR/$BINARY_NAME"
+chmod +x "$INSTALL_DIR/$BINARY_NAME"
+trap - EXIT
+echo "✓ $BINARY_NAME installed to $INSTALL_DIR/$BINARY_NAME"
+
+# ── Add INSTALL_DIR to PATH using the right profile for the active shell ──────
+add_to_path() {
+    # Already reachable in this session — nothing to wire up.
+    case ":$PATH:" in
+        *":$INSTALL_DIR:"*) return 0 ;;
+    esac
+
+    local shell_name profile line
+    shell_name="$(basename "${SHELL:-sh}")"
+    case "$shell_name" in
+        zsh)
+            profile="${ZDOTDIR:-$HOME}/.zshrc"
+            line="export PATH=\"$INSTALL_DIR:\$PATH\""
+            ;;
+        bash)
+            # macOS login shells read .bash_profile; Linux uses .bashrc.
+            if [ "$OS" = "darwin" ]; then profile="$HOME/.bash_profile"; else profile="$HOME/.bashrc"; fi
+            line="export PATH=\"$INSTALL_DIR:\$PATH\""
+            ;;
+        fish)
+            profile="$HOME/.config/fish/config.fish"
+            line="fish_add_path \"$INSTALL_DIR\""
+            mkdir -p "$(dirname "$profile")"
+            ;;
+        *)
+            profile="$HOME/.profile"
+            line="export PATH=\"$INSTALL_DIR:\$PATH\""
+            ;;
+    esac
+
+    touch "$profile"
+    if grep -qF "$INSTALL_DIR" "$profile" 2>/dev/null; then
+        echo "✓ PATH entry already present in $profile"
+    else
+        printf '\n# Added by mimicode installer\n%s\n' "$line" >> "$profile"
+        echo "✓ Added $INSTALL_DIR to PATH in $profile"
+    fi
+    echo "  Restart your shell or run: source \"$profile\""
+}
+add_to_path
+
+# ── Verify ───────────────────────────────────────────────────────────────────
 if ! "$INSTALL_DIR/$BINARY_NAME" --version >/dev/null 2>&1; then
-    echo "⚠️  Installation completed but binary verification failed"
+    echo "⚠️  Installed but '$BINARY_NAME --version' failed — check the output above."
 fi
 
-# Check if ripgrep is installed
+# ── Dependency / environment checks ──────────────────────────────────────────
 if ! command -v rg >/dev/null 2>&1; then
     echo ""
     echo "⚠️  ripgrep (rg) is required but not installed."
-    echo "   Install it from: https://github.com/BurntSushi/ripgrep#installation"
-    echo ""
     case "$OS" in
-        darwin)
-            echo "   Quick install: brew install ripgrep"
-            ;;
-        linux)
-            echo "   Quick install: sudo apt install ripgrep  # Debian/Ubuntu"
-            echo "                  sudo dnf install ripgrep  # Fedora"
-            ;;
+        darwin) echo "   Install: brew install ripgrep" ;;
+        linux)  echo "   Install: sudo apt install ripgrep   # Debian/Ubuntu"
+                echo "            sudo dnf install ripgrep   # Fedora" ;;
     esac
 fi
 
-# Check PATH
-if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-    echo ""
-    echo "⚠️  $INSTALL_DIR is not in your PATH."
-    echo "   Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-    echo ""
-    echo "   export PATH=\"\$HOME/.local/bin:\$PATH\""
-    echo ""
-fi
-
-# Check API key
-if [ -z "$ANTHROPIC_API_KEY" ]; then
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
     echo ""
     echo "⚠️  ANTHROPIC_API_KEY not set."
-    echo "   Get your API key from: https://console.anthropic.com/settings/keys"
-    echo "   Then add to your shell profile:"
-    echo ""
-    echo "   export ANTHROPIC_API_KEY=\"your-key-here\""
-    echo ""
+    echo "   Get a key at https://console.anthropic.com/settings/keys then run:"
+    echo "     $BINARY_NAME key --set your-key-here"
+    echo "   or set it in your shell:"
+    echo "     export ANTHROPIC_API_KEY=\"your-key-here\""
 fi
 
 echo ""
