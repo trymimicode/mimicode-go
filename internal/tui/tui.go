@@ -1052,6 +1052,16 @@ func (m *model) handleStream(msg streamMsg) {
 		name, _ := msg.Data["name"].(string)
 		m.lastTool = name
 		m.toolStatus = fmt.Sprintf("Completed %s", name)
+		if name == "bash" {
+			if input, ok := msg.Data["input"].(map[string]any); ok {
+				if cmd, _ := input["cmd"].(string); cmd != "" {
+					l := line{Kind: "tool", Text: "$ " + cmd}
+					m.lines = append(m.lines, l)
+					m.allToolLines = append(m.allToolLines, l)
+					m.bumpCache()
+				}
+			}
+		}
 		m.scrollToBottom()
 	case "file_change":
 		path, _ := msg.Data["path"].(string)
