@@ -8,41 +8,56 @@ import (
 	"github.com/trymimicode/mimicode-go/internal/provider"
 )
 
-func TestAgentTurnToolLoopThenFinalResponse(t *testing.T) {
-	oldCallClaude := callClaude
-	oldCallClaudeStreaming := callClaudeStreaming
-	defer func() {
-		callClaude = oldCallClaude
-		callClaudeStreaming = oldCallClaudeStreaming
-	}()
+// funcProvider is a test-only Provider backed by plain functions.
+type funcProvider struct {
+	call          func(ctx context.Context, messages []provider.Message, system string, tools []provider.ToolSchema, model string) (provider.Message, provider.Usage, error)
+	callStreaming  func(ctx context.Context, messages []provider.Message, system string, tools []provider.ToolSchema, model string, cb provider.StreamCallback) (provider.Message, provider.Usage, error)
+}
 
+func (p funcProvider) Call(ctx context.Context, messages []provider.Message, system string, tools []provider.ToolSchema, model string) (provider.Message, provider.Usage, error) {
+	return p.call(ctx, messages, system, tools, model)
+}
+
+func (p funcProvider) CallStreaming(ctx context.Context, messages []provider.Message, system string, tools []provider.ToolSchema, model string, cb provider.StreamCallback) (provider.Message, provider.Usage, error) {
+	if p.callStreaming != nil {
+		return p.callStreaming(ctx, messages, system, tools, model, cb)
+	}
+	return p.call(ctx, messages, system, tools, model)
+}
+
+func (p funcProvider) DefaultModel() string { return "test-model" }
+
+func TestAgentTurnToolLoopThenFinalResponse(t *testing.T) {
 	var calls int
-	callClaude = func(ctx context.Context, messages []provider.Message, system string, tools []provider.ToolSchema, model string) (provider.Message, provider.Usage, error) {
-		calls++
-		if calls == 1 {
+	prov := funcProvider{
+		call: func(ctx context.Context, messages []provider.Message, system string, tools []provider.ToolSchema, model string) (provider.Message, provider.Usage, error) {
+			calls++
+			if calls == 1 {
+				return provider.Message{
+					Role: "assistant",
+					Content: []provider.ContentBlock{{
+						Type:  "tool_use",
+						ID:    "tu_1",
+						Name:  "bash",
+						Input: map[string]any{"cmd": "echo hello"},
+					}},
+				}, provider.Usage{}, nil
+			}
 			return provider.Message{
 				Role: "assistant",
 				Content: []provider.ContentBlock{{
-					Type:  "tool_use",
-					ID:    "tu_1",
-					Name:  "bash",
-					Input: map[string]any{"cmd": "echo hello"},
+					Type: "text",
+					Text: "done",
 				}},
 			}, provider.Usage{}, nil
-		}
-		return provider.Message{
-			Role: "assistant",
-			Content: []provider.ContentBlock{{
-				Type: "text",
-				Text: "done",
-			}},
-		}, provider.Usage{}, nil
+		},
 	}
 
 	t.Setenv("MIMICODE_COMPACT_AUTO", "0")
 	messages, err := AgentTurn(context.Background(), AgentConfig{
 		CWD:      t.TempDir(),
 		MaxSteps: 5,
+		Provider: prov,
 	}, "please run echo", nil)
 	if err != nil {
 		t.Fatalf("AgentTurn: %v", err)
