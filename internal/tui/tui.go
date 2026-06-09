@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -80,6 +81,14 @@ type readingFile struct {
 	lineIdx int // index in m.lines where the placeholder sits
 }
 
+// pasteEntity marks a range in m.input that arrived as a multi-line paste.
+// It is displayed as a pill ([pasted N lines]) and deleted atomically.
+type pasteEntity struct {
+	start   int    // byte offset in m.input, inclusive
+	end     int    // byte offset in m.input, exclusive
+	display string // e.g. "[pasted 3 lines]"
+}
+
 type model struct {
 	session  *store.Session
 	cwd      string
@@ -149,6 +158,8 @@ type model struct {
 
 	lastPrompt     string             // prompt from the most recent submit
 	beforeMessages []provider.Message // messages snapshot before the most recent submit
+
+	pasteEntities []pasteEntity // atomic multi-line paste ranges within m.input
 }
 
 var (
@@ -653,6 +664,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				def := slashDefs[m.slashSuggest[m.slashSelIdx]]
 				m.input = ""
 				m.cursor = 0
+				m.pasteEntities = nil
 				m.slashSuggest = nil
 				m.slashSelIdx = 0
 				m.executeSlash(def.cmd, nil)
@@ -663,6 +675,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				cmd := strings.TrimPrefix(parts[0], "/")
 				m.input = ""
 				m.cursor = 0
+				m.pasteEntities = nil
 				m.slashSuggest = nil
 				m.slashSelIdx = 0
 				m.executeSlash(cmd, parts[1:])
@@ -680,10 +693,19 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyBackspace, tea.KeyDelete:
 		if !m.running && len(m.input) > 0 && m.cursor > 0 {
-			left := m.input[:m.cursor-1]
-			right := m.input[m.cursor:]
-			m.input = left + right
-			m.cursor--
+			if idx := m.entityEndingAt(m.cursor); idx >= 0 {
+				e := m.pasteEntities[idx]
+				m.input = m.input[:e.start] + m.input[e.end:]
+				m.pasteEntities = append(m.pasteEntities[:idx], m.pasteEntities[idx+1:]...)
+				m.shiftEntities(e.start, -(e.end - e.start))
+				m.cursor = e.start
+			} else {
+				left := m.input[:m.cursor-1]
+				right := m.input[m.cursor:]
+				m.input = left + right
+				m.shiftEntities(m.cursor, -1)
+				m.cursor--
+			}
 			m.updateSlashSuggest()
 			m.updateAtSuggest()
 		}
@@ -691,11 +713,17 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyLeft:
 		if !m.running && m.cursor > 0 {
 			m.cursor--
+			if idx := m.entityAt(m.cursor); idx >= 0 {
+				m.cursor = m.pasteEntities[idx].start
+			}
 		}
 
 	case tea.KeyRight:
 		if !m.running && m.cursor < len(m.input) {
 			m.cursor++
+			if idx := m.entityAt(m.cursor); idx >= 0 {
+				m.cursor = m.pasteEntities[idx].end
+			}
 		}
 
 	case tea.KeyHome:
@@ -799,6 +827,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.historyIdx = -1
 					m.input = ""
 					m.cursor = 0
+					m.pasteEntities = nil
 				}
 			} else {
 				m.scroll++
@@ -880,12 +909,29 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	default:
 		if !m.running && msg.Type == tea.KeyRunes {
 			text := string(msg.Runes)
-			left := m.input[:m.cursor]
-			right := m.input[m.cursor:]
-			m.input = left + text + right
-			m.cursor += len(text)
-			m.updateSlashSuggest()
-			m.updateAtSuggest()
+			if strings.Contains(text, "\n") {
+				// Multi-line paste: keep real text in m.input but record as atomic entity.
+				nLines := strings.Count(text, "\n") + 1
+				disp := fmt.Sprintf("[pasted %d lines]", nLines)
+				m.shiftEntities(m.cursor, len(text))
+				m.pasteEntities = append(m.pasteEntities, pasteEntity{
+					start:   m.cursor,
+					end:     m.cursor + len(text),
+					display: disp,
+				})
+				left := m.input[:m.cursor]
+				right := m.input[m.cursor:]
+				m.input = left + text + right
+				m.cursor += len(text)
+			} else {
+				m.shiftEntities(m.cursor, len(text))
+				left := m.input[:m.cursor]
+				right := m.input[m.cursor:]
+				m.input = left + text + right
+				m.cursor += len(text)
+				m.updateSlashSuggest()
+				m.updateAtSuggest()
+			}
 		}
 	}
 	return m, nil
@@ -1000,7 +1046,8 @@ func (m *model) View() string {
 	} else if strings.Contains(m.input, "\n") {
 		prompt = "│ "
 	}
-	inputLines := wrapInput(m.input, m.width-len(prompt)-2, m.cursor)
+	dispText, dispCursor := m.inputDisplay()
+	inputLines := wrapInput(dispText, m.width-len(prompt)-2, dispCursor)
 	for i, ln := range inputLines {
 		if i == 0 {
 			b.WriteString(inputStyle.Render(prompt + ln))
@@ -1036,6 +1083,7 @@ func (m *model) submit() {
 	
 	m.input = ""
 	m.cursor = 0
+	m.pasteEntities = nil
 	m.slashSuggest = nil
 	m.slashSelIdx = 0
 	m.atSuggest = nil
@@ -1613,6 +1661,75 @@ func wrapText(text string, width int) string {
 		lineLen += len(word)
 	}
 	return result.String()
+}
+
+// entityAt returns the index of the paste entity that strictly contains cursor
+// (start < cursor < end). Returns -1 if none.
+func (m *model) entityAt(cursor int) int {
+	for i, e := range m.pasteEntities {
+		if e.start < cursor && cursor < e.end {
+			return i
+		}
+	}
+	return -1
+}
+
+// entityEndingAt returns the index of the paste entity whose end equals cursor.
+// Returns -1 if none. Used by backspace to delete the entity atomically.
+func (m *model) entityEndingAt(cursor int) int {
+	for i, e := range m.pasteEntities {
+		if e.end == cursor {
+			return i
+		}
+	}
+	return -1
+}
+
+// shiftEntities adjusts the start/end of every paste entity whose start is >= from
+// by delta bytes. Call after inserting or deleting plain text at position from.
+func (m *model) shiftEntities(from, delta int) {
+	for i := range m.pasteEntities {
+		if m.pasteEntities[i].start >= from {
+			m.pasteEntities[i].start += delta
+			m.pasteEntities[i].end += delta
+		}
+	}
+}
+
+// inputDisplay returns the display version of m.input (entity ranges replaced with
+// their pill text) and the corresponding cursor position within that display string.
+func (m *model) inputDisplay() (string, int) {
+	if len(m.pasteEntities) == 0 {
+		return m.input, m.cursor
+	}
+	entities := make([]pasteEntity, len(m.pasteEntities))
+	copy(entities, m.pasteEntities)
+	sort.Slice(entities, func(i, j int) bool { return entities[i].start < entities[j].start })
+
+	var b strings.Builder
+	rawOff := 0
+	for _, e := range entities {
+		b.WriteString(m.input[rawOff:e.start])
+		b.WriteString(e.display)
+		rawOff = e.end
+	}
+	b.WriteString(m.input[rawOff:])
+	display := b.String()
+
+	// Map m.cursor (raw) → display cursor offset.
+	rawOff = 0
+	dispOff := 0
+	for _, e := range entities {
+		if m.cursor <= e.start {
+			return display, dispOff + (m.cursor - rawOff)
+		}
+		dispOff += (e.start - rawOff) + len(e.display)
+		rawOff = e.end
+		if m.cursor <= e.end {
+			return display, dispOff
+		}
+	}
+	return display, dispOff + (m.cursor - rawOff)
 }
 
 func wrapInput(text string, width int, cursor int) []string {
