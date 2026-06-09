@@ -31,13 +31,13 @@ type Session struct {
 	Model     string    `json:"model"`
 
 	mu      sync.Mutex
-	f       *os.File // events.jsonl kept open — no open/close per write
+	f       *os.File // events.jsonl kept open â€” no open/close per write
 	start   time.Time
 	dir     string // ~/.mimi/sessions/<id>/
 	turnNum int    // incremented by LogUser
 }
 
-// ── Event types ───────────────────────────────────────────────────────────────
+// â”€â”€ Event types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 // CallRec is one tool_use block from a model response.
 type CallRec struct {
@@ -55,7 +55,7 @@ type TokenRec struct {
 }
 
 // ModelEvent captures a full model response: what it said + what it called + cost.
-// Text is the model's prose output before/between tool calls — the decision trace.
+// Text is the model's prose output before/between tool calls â€” the decision trace.
 type ModelEvent struct {
 	Model  string    `json:"model"`
 	Text   string    `json:"text,omitempty"`
@@ -81,7 +81,7 @@ type ToolDoneEvent struct {
 	Preview string `json:"preview,omitempty"`
 }
 
-// ── JSONL envelope ────────────────────────────────────────────────────────────
+// â”€â”€ JSONL envelope â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 type entry struct {
 	T    float64 `json:"t"`
@@ -92,7 +92,7 @@ type entry struct {
 	Data any     `json:"data"`
 }
 
-// ── Lifecycle ─────────────────────────────────────────────────────────────────
+// â”€â”€ Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func New(id, cwd, model string) (*Session, error) {
 	if id == "" {
@@ -159,7 +159,7 @@ func (s *Session) Close() {
 // Path returns the session directory (all session files live here).
 func (s *Session) Path() string { return s.dir }
 
-// ── Event logging ─────────────────────────────────────────────────────────────
+// â”€â”€ Event logging â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 // LogUser logs a user message and returns the turn number (1-based).
 func (s *Session) LogUser(text string) int {
@@ -213,7 +213,7 @@ func (s *Session) log(turn, step int, kind string, data any) {
 	s.f.Write([]byte("\n"))
 }
 
-// ── Message persistence ───────────────────────────────────────────────────────
+// â”€â”€ Message persistence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func (s *Session) SaveMessages(messages []provider.Message) error {
 	path := filepath.Join(s.dir, "messages.json")
@@ -239,12 +239,4 @@ func (s *Session) LoadMessages() ([]provider.Message, error) {
 		return []provider.Message{}, nil
 	}
 	return messages, nil
-}
-
-func (s *Session) MessagesCount() int {
-	msgs, err := s.LoadMessages()
-	if err != nil {
-		return 0
-	}
-	return len(msgs)
 }
