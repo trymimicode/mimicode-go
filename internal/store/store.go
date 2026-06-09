@@ -1,12 +1,14 @@
 package store
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -92,6 +94,81 @@ type entry struct {
 	Data any     `json:"data"`
 }
 
+// ── Session browser ──────────────────────────────────────────────────────────
+
+// SessionSummary is a lightweight snapshot of a session used by the browser.
+type SessionSummary struct {
+	ID        string
+	StartedAt time.Time
+	Model     string
+	CWD       string
+	Preview   string // first user message, truncated
+}
+
+// ListSessions returns all sessions sorted newest-first.
+func ListSessions() ([]SessionSummary, error) {
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []SessionSummary
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		out = append(out, summarizeSession(filepath.Join(sessionsDir, e.Name()), e.Name()))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].StartedAt.After(out[j].StartedAt)
+	})
+	return out, nil
+}
+
+func summarizeSession(dir, id string) SessionSummary {
+	s := SessionSummary{ID: id}
+	if info, err := os.Stat(dir); err == nil {
+		s.StartedAt = info.ModTime()
+	}
+	f, err := os.Open(filepath.Join(dir, "events.jsonl"))
+	if err != nil {
+		return s
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var e entry
+		if json.Unmarshal(sc.Bytes(), &e) != nil {
+			continue
+		}
+		m, _ := e.Data.(map[string]any)
+		if m == nil {
+			continue
+		}
+		switch e.Kind {
+		case "session_start":
+			s.Model, _ = m["model"].(string)
+			s.CWD, _ = m["cwd"].(string)
+		case "user":
+			if s.Preview == "" {
+				text, _ := m["text"].(string)
+				if text != "" {
+					runes := []rune(text)
+					if len(runes) > 80 {
+						runes = runes[:80]
+						s.Preview = string(runes) + "\u2026"
+					} else {
+						s.Preview = text
+					}
+				}
+			}
+		}
+	}
+	return s
+}
+
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 func New(id, cwd, model string) (*Session, error) {
@@ -158,6 +235,21 @@ func (s *Session) Close() {
 
 // Path returns the session directory (all session files live here).
 func (s *Session) Path() string { return s.dir }
+
+// Rename renames the session directory to newID and updates the session ID and
+// dir path. The open file handle inside the directory remains valid after the
+// rename on all supported platforms.
+func (s *Session) Rename(newID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	newDir := filepath.Join(sessionsDir, newID)
+	if err := os.Rename(s.dir, newDir); err != nil {
+		return fmt.Errorf("store: rename session: %w", err)
+	}
+	s.ID = newID
+	s.dir = newDir
+	return nil
+}
 
 // ── Event logging ─────────────────────────────────────────────────────────────
 
@@ -239,12 +331,4 @@ func (s *Session) LoadMessages() ([]provider.Message, error) {
 		return []provider.Message{}, nil
 	}
 	return messages, nil
-}
-
-func (s *Session) MessagesCount() int {
-	msgs, err := s.LoadMessages()
-	if err != nil {
-		return 0
-	}
-	return len(msgs)
 }

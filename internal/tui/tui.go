@@ -1,19 +1,29 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
 	"strings"
 	"time"
 
+	chroma "github.com/alecthomas/chroma/v2"
+	"github.com/alecthomas/chroma/v2/formatters"
+	"github.com/alecthomas/chroma/v2/lexers"
+	"github.com/alecthomas/chroma/v2/styles"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/trymimicode/mimicode-go/internal/agent"
 	"github.com/trymimicode/mimicode-go/internal/compactor"
+	"github.com/trymimicode/mimicode-go/internal/recovery"
 	"github.com/trymimicode/mimicode-go/internal/provider"
 	"github.com/trymimicode/mimicode-go/internal/reflect"
 	"github.com/trymimicode/mimicode-go/internal/store"
@@ -34,8 +44,9 @@ type turnDoneMsg struct {
 type tickMsg time.Time
 
 const (
-	modeChat = 0
-	modeDiff = 1
+	modeChat    = 0
+	modeDiff    = 1
+	modeSession = 2
 )
 
 type slashDef struct{ cmd, args, desc string }
@@ -47,6 +58,7 @@ var slashDefs = []slashDef{
 	{"help", "", "List commands"},
 	{"new", "", "Start a new session"},
 	{"diff", "", "Browse changed files"},
+	{"sessions", "", "Browse past sessions"},
 }
 
 type line struct {
@@ -55,13 +67,26 @@ type line struct {
 	Diff *tools.DiffInfo
 }
 
+type selPos struct {
+	row, col int
+}
+
 // readingFile tracks the animated "reading" state for a single file.
 type readingFile struct {
 	path    string
 	lines   []string
+	hlLines []string // syntax-highlighted version of lines
 	cursor  int
 	speed   int
 	lineIdx int // index in m.lines where the placeholder sits
+}
+
+// pasteEntity marks a range in m.input that arrived as a multi-line paste.
+// It is displayed as a pill ([pasted N lines]) and deleted atomically.
+type pasteEntity struct {
+	start   int    // byte offset in m.input, inclusive
+	end     int    // byte offset in m.input, exclusive
+	display string // e.g. "[pasted 3 lines]"
 }
 
 type model struct {
@@ -92,25 +117,49 @@ type model struct {
 	allToolLines []line       // tool diffs/reads accumulated across all turns
 
 	program    *tea.Program
-	lineCache  []string // cached output of renderedLines()
-	cacheDirty bool     // true when lineCache must be recomputed
+	lineCache     []string // cached output of renderedLines()
+	cacheDirty    bool     // true when lineCache must be recomputed
+	lineHits      []string // parallel to lineCache; file path or "" per rendered line
+	lineHitsDirty bool
 
 	// files bar / diff view
 	mode         int             // modeChat | modeDiff
 	changedFiles []tools.DiffInfo // deduplicated, latest diff per path
 	fileIdx      int             // selected file (files bar and diff view)
 	fileBarFocus bool            // files bar has keyboard focus
-	diffScroll   int             // scroll offset within diff view
+	diffScroll      int  // scroll offset within diff view
+	diffTypingHint  bool // show navigate-mode hint after rune key in diff view
 
 	// slash commands
 	slashSuggest []int // matching slashDefs indices for current input
 	slashSelIdx  int   // which suggestion is highlighted
+
+	// @ file picker
+	atSuggest []string // matching file paths for current @fragment
+	atSelIdx  int
+	allFiles  []string // cached rg --files output
 
 	// accumulated usage across all turns
 	totalUsage provider.Usage
 
 	// model override (set by /model command)
 	modelOverride string
+
+	// session browser
+	sessionList   []store.SessionSummary
+	sessionScroll int
+
+	// text selection
+	selActive bool   // mouse button held
+	selAnchor selPos // position where press began
+	selEnd    selPos // position of current drag
+	hasSel          bool   // a completed selection exists
+	waitingContinue bool   // true after hitting the 25-step limit
+
+	lastPrompt     string             // prompt from the most recent submit
+	beforeMessages []provider.Message // messages snapshot before the most recent submit
+
+	pasteEntities []pasteEntity // atomic multi-line paste ranges within m.input
 }
 
 var (
@@ -125,11 +174,17 @@ var (
 	diffLineNumStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	diffAddMarkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("34")).Bold(true)
 	diffRemMarkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
-	diffCodeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-	diffFadedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	diffCodeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	diffFadedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	readCursorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Background(lipgloss.Color("238")).Bold(true)
 	readDimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	streamHeadStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
+	selStyle         = lipgloss.NewStyle().Background(lipgloss.Color("24")).Foreground(lipgloss.Color("255"))
+
+	// session browser
+	sessionHeaderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("236")).Bold(true)
+	sessionRowStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("232"))
+	sessionSelStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("237")).Bold(true)
 
 	// files bar
 	fileTabStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(lipgloss.Color("234")).PaddingLeft(1).PaddingRight(1)
@@ -148,6 +203,12 @@ var (
 	slashItemSelStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("237")).Bold(true).PaddingLeft(1)
 	slashCmdStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
 	slashArgStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+)
+
+var (
+	ansiEscRe   = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	backtickRe  = regexp.MustCompile("`([^`]+)`")
+	pathShapeRe = regexp.MustCompile(`[\w.\-/]+\.\w+`)
 )
 
 func RunTUI(sessionID string) error {
@@ -222,7 +283,50 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.totalUsage.OutputTokens += msg.Usage.OutputTokens
 		m.currentCost = estimateCost(msg.Usage)
 		if msg.Err != nil {
-			m.lines = append(m.lines, line{Kind: "error", Text: "error: " + msg.Err.Error()})
+			stuck, isStuck := agent.IsStuck(msg.Err)
+			if isStuck && agent.IsMaxSteps(stuck) {
+				m.waitingContinue = true
+				m.lines = append(m.lines, line{Kind: "tool", Text: "hit 25-step limit — type 'y' to continue or ask something new"})
+			} else if isStuck {
+				m.lines = append(m.lines, line{Kind: "tool", Text: "retrying…"})
+				m.running = true
+				ctx, cancel := context.WithCancel(context.Background())
+				m.cancel = cancel
+				sess := m.session
+				cwd := m.cwd
+				modelName := m.modelName
+				lastPrompt := m.lastPrompt
+				beforeMsgs := m.beforeMessages
+				stuckReason := stuck.Reason
+				cb := func(eventType string, data map[string]any) {
+					if m.program != nil {
+						m.program.Send(streamMsg{Event: eventType, Data: data})
+					}
+				}
+				go func() {
+					retryPrompt := lastPrompt
+					if sess != nil {
+						if diag, err := recovery.Diagnose(ctx, sess, stuckReason); err == nil {
+							retryPrompt = lastPrompt + "\n\n[recovery] A previous attempt got stuck. Root cause: " + diag.WentWrong
+							if diag.Instruction != "" {
+								retryPrompt += " Take a different approach: " + diag.Instruction
+							}
+						}
+					}
+					next, err := agent.AgentTurn(ctx, agent.AgentConfig{
+						CWD:      cwd,
+						Session:  sess,
+						MaxSteps: 25,
+						StreamCB: cb,
+						Model:    modelName,
+					}, retryPrompt, beforeMsgs)
+					if m.program != nil {
+						m.program.Send(turnDoneMsg{Messages: next, Err: err, Usage: provider.LastUsage()})
+					}
+				}()
+			} else {
+				m.lines = append(m.lines, line{Kind: "error", Text: "error: " + msg.Err.Error()})
+			}
 		}
 		if m.session != nil {
 			_ = m.session.SaveMessages(m.messages)
@@ -256,13 +360,63 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tea.MouseMsg:
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			m.handleMouseClick(msg.X, msg.Y)
+			// start selection tracking; defer click handling until release
+			p := selPos{msg.Y + m.scroll, msg.X}
+			m.selActive = true
+			m.selAnchor = p
+			m.selEnd = p
+			m.hasSel = false
+			m.bumpCache()
+		}
+		if msg.Action == tea.MouseActionMotion && m.selActive {
+			m.selEnd = selPos{msg.Y + m.scroll, msg.X}
+			m.hasSel = m.selEnd != m.selAnchor
+			m.bumpCache()
+		}
+		if msg.Action == tea.MouseActionRelease && msg.Button == tea.MouseButtonLeft {
+			m.selActive = false
+			if !m.hasSel {
+				// plain click — fire existing click logic
+				m.handleMouseClick(msg.X, msg.Y)
+			} else {
+				m.copySelectionToClipboard()
+			}
+			m.bumpCache()
+		}
+		if msg.Button == tea.MouseButtonWheelUp {
+			if m.mode == modeDiff {
+				m.diffScroll -= 3
+				if m.diffScroll < 0 {
+					m.diffScroll = 0
+				}
+			} else {
+				m.scroll -= 3
+				m.clampScroll()
+			}
+		}
+		if msg.Button == tea.MouseButtonWheelDown {
+			if m.mode == modeDiff {
+				m.diffScroll += 3
+			} else {
+				m.scroll += 3
+				m.clampScroll()
+			}
 		}
 	}
 	return m, nil
 }
 
 func (m *model) handleMouseClick(x, y int) {
+	// Check for clickable file paths in the chat area (chat mode only).
+	if m.mode == modeChat {
+		hits := m.cachedLineHits()
+		idx := y + m.scroll
+		if idx >= 0 && idx < len(hits) && hits[idx] != "" {
+			m.openFileInDiff(hits[idx])
+			return
+		}
+	}
+
 	// Files bar is at a fixed row from the bottom:
 	// height - (1 input + 1 status + 1 files bar) = height - 3
 	if len(m.changedFiles) == 0 || m.mode == modeDiff {
@@ -285,11 +439,93 @@ func (m *model) handleMouseClick(x, y int) {
 			m.fileBarFocus = true
 			return
 		}
-		offset += tabWidth + 2 // +2 for separator " │"
+	offset += tabWidth + 2 // +2 for separator " │"
 	}
 }
 
+func (m *model) openFileInDiff(rel string) {
+	content, err := os.ReadFile(filepath.Join(m.cwd, rel))
+	if err != nil {
+		return
+	}
+	d := tools.DiffInfo{
+		Operation:  "view",
+		Path:       rel,
+		IsNewFile:  true,
+		NewContent: string(content),
+	}
+	m.upsertChangedFile(d)
+	for i, f := range m.changedFiles {
+		if f.Path == rel {
+			m.fileIdx = i
+			break
+		}
+	}
+	m.mode = modeDiff
+	m.diffScroll = 0
+}
+
+func (m *model) copySelectionToClipboard() {
+	rendered := m.renderedLines()
+	lo, hi := m.selAnchor, m.selEnd
+	if lo.row > hi.row || (lo.row == hi.row && lo.col > hi.col) {
+		lo, hi = hi, lo
+	}
+	if lo.row < 0 {
+		lo.row = 0
+	}
+	if hi.row >= len(rendered) {
+		hi.row = len(rendered) - 1
+	}
+	var lines []string
+	for i := lo.row; i <= hi.row; i++ {
+		plain := ansiEscRe.ReplaceAllString(rendered[i], "")
+		runes := []rune(plain)
+		n := len(runes)
+		startCol, endCol := 0, n
+		if i == lo.row {
+			startCol = lo.col
+		}
+		if i == hi.row {
+			endCol = hi.col
+		}
+		if startCol > n {
+			startCol = n
+		}
+		if endCol > n {
+			endCol = n
+		}
+		lines = append(lines, string(runes[startCol:endCol]))
+	}
+	text := strings.Join(lines, "\n")
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	case "windows":
+		cmd = exec.Command("clip")
+	default:
+		cmd = exec.Command("xclip", "-selection", "clipboard")
+	}
+	cmd.Stdin = strings.NewReader(text)
+	_ = cmd.Run()
+}
+
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Ctrl+C with an active selection copies instead of quitting.
+	if msg.Type == tea.KeyCtrlC && m.hasSel {
+		m.copySelectionToClipboard()
+		m.hasSel = false
+		m.selActive = false
+		m.bumpCache()
+		return m, nil
+	}
+	// Any key clears an existing text selection.
+	if m.hasSel || m.selActive {
+		m.hasSel = false
+		m.selActive = false
+		m.bumpCache()
+	}
 	// ── Diff view mode ───────────────────────────────────────────────────────
 	if m.mode == modeDiff {
 		switch msg.Type {
@@ -308,18 +544,62 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.diffScroll = 0
 			}
 		case tea.KeyUp:
+			m.diffTypingHint = false
 			if m.diffScroll > 0 {
 				m.diffScroll--
 			}
 		case tea.KeyDown:
+			m.diffTypingHint = false
 			m.diffScroll++
 		case tea.KeyPgUp:
+			m.diffTypingHint = false
 			m.diffScroll -= m.height - 2
 			if m.diffScroll < 0 {
 				m.diffScroll = 0
 			}
 		case tea.KeyPgDown:
+			m.diffTypingHint = false
 			m.diffScroll += m.height - 2
+		default:
+			if msg.Type == tea.KeyRunes {
+				m.diffTypingHint = true
+			}
+		}
+		return m, nil
+	}
+
+	// ── Session browser mode ─────────────────────────────────────────────────
+	if m.mode == modeSession {
+		switch msg.Type {
+		case tea.KeyCtrlD:
+			return m, tea.Quit
+		case tea.KeyCtrlC, tea.KeyEsc:
+			m.mode = modeChat
+		case tea.KeyUp:
+			if m.sessionScroll > 0 {
+				m.sessionScroll--
+			}
+		case tea.KeyDown:
+			if m.sessionScroll < len(m.sessionList)-1 {
+				m.sessionScroll++
+			}
+		case tea.KeyEnter:
+			if len(m.sessionList) > 0 {
+				sel := m.sessionList[m.sessionScroll]
+				sess, msgs, err := store.ResumeOrNew(sel.ID, m.cwd, m.modelName)
+				if err == nil {
+					m.session = sess
+					m.messages = msgs
+					m.lines = renderMessages(msgs)
+				}
+				m.allToolLines = nil
+				m.changedFiles = nil
+				m.streamText = ""
+				m.totalUsage = provider.Usage{}
+				m.mode = modeChat
+				m.bumpCache()
+				m.scrollToBottom()
+			}
 		}
 		return m, nil
 	}
@@ -366,7 +646,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case tea.KeyEsc:
-		// Dismiss slash menu
+		// Dismiss @ and slash menus
+		m.atSuggest = nil
+		m.atSelIdx = 0
 		m.slashSuggest = nil
 		m.slashSelIdx = 0
 
@@ -374,11 +656,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.running {
 			if m.showOnboarding {
 				m.showOnboarding = false
+			} else if len(m.atSuggest) > 0 {
+				m.atCompleteSelected()
+				return m, nil
 			} else if len(m.slashSuggest) > 0 {
 				// Execute highlighted slash command
 				def := slashDefs[m.slashSuggest[m.slashSelIdx]]
 				m.input = ""
 				m.cursor = 0
+				m.pasteEntities = nil
 				m.slashSuggest = nil
 				m.slashSelIdx = 0
 				m.executeSlash(def.cmd, nil)
@@ -389,6 +675,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				cmd := strings.TrimPrefix(parts[0], "/")
 				m.input = ""
 				m.cursor = 0
+				m.pasteEntities = nil
 				m.slashSuggest = nil
 				m.slashSelIdx = 0
 				m.executeSlash(cmd, parts[1:])
@@ -406,21 +693,37 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyBackspace, tea.KeyDelete:
 		if !m.running && len(m.input) > 0 && m.cursor > 0 {
-			left := m.input[:m.cursor-1]
-			right := m.input[m.cursor:]
-			m.input = left + right
-			m.cursor--
+			if idx := m.entityEndingAt(m.cursor); idx >= 0 {
+				e := m.pasteEntities[idx]
+				m.input = m.input[:e.start] + m.input[e.end:]
+				m.pasteEntities = append(m.pasteEntities[:idx], m.pasteEntities[idx+1:]...)
+				m.shiftEntities(e.start, -(e.end - e.start))
+				m.cursor = e.start
+			} else {
+				left := m.input[:m.cursor-1]
+				right := m.input[m.cursor:]
+				m.input = left + right
+				m.shiftEntities(m.cursor, -1)
+				m.cursor--
+			}
 			m.updateSlashSuggest()
+			m.updateAtSuggest()
 		}
 
 	case tea.KeyLeft:
 		if !m.running && m.cursor > 0 {
 			m.cursor--
+			if idx := m.entityAt(m.cursor); idx >= 0 {
+				m.cursor = m.pasteEntities[idx].start
+			}
 		}
 
 	case tea.KeyRight:
 		if !m.running && m.cursor < len(m.input) {
 			m.cursor++
+			if idx := m.entityAt(m.cursor); idx >= 0 {
+				m.cursor = m.pasteEntities[idx].end
+			}
 		}
 
 	case tea.KeyHome:
@@ -445,7 +748,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyUp:
-		if len(m.slashSuggest) > 0 {
+		if len(m.atSuggest) > 0 {
+			m.atSelIdx--
+			if m.atSelIdx < 0 {
+				m.atSelIdx = len(m.atSuggest) - 1
+			}
+		} else if len(m.slashSuggest) > 0 {
 			m.slashSelIdx--
 			if m.slashSelIdx < 0 {
 				m.slashSelIdx = len(m.slashSuggest) - 1
@@ -487,7 +795,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyDown:
-		if len(m.slashSuggest) > 0 {
+		if len(m.atSuggest) > 0 {
+			m.atSelIdx = (m.atSelIdx + 1) % len(m.atSuggest)
+		} else if len(m.slashSuggest) > 0 {
 			m.slashSelIdx = (m.slashSelIdx + 1) % len(m.slashSuggest)
 		} else if !m.running {
 			if strings.Contains(m.input, "\n") {
@@ -517,6 +827,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.historyIdx = -1
 					m.input = ""
 					m.cursor = 0
+					m.pasteEntities = nil
 				}
 			} else {
 				m.scroll++
@@ -537,7 +848,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyTab:
 		if !m.running {
-			if len(m.slashSuggest) > 0 {
+			if len(m.atSuggest) > 0 {
+				m.atCompleteSelected()
+				return m, nil
+			} else if len(m.slashSuggest) > 0 {
 				// Complete to selected command
 				def := slashDefs[m.slashSuggest[m.slashSelIdx]]
 				suffix := ""
@@ -593,12 +907,31 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	default:
-		if !m.running {
-			left := m.input[:m.cursor]
-			right := m.input[m.cursor:]
-			m.input = left + msg.String() + right
-			m.cursor += len(msg.String())
-			m.updateSlashSuggest()
+		if !m.running && msg.Type == tea.KeyRunes {
+			text := string(msg.Runes)
+			if strings.Contains(text, "\n") {
+				// Multi-line paste: keep real text in m.input but record as atomic entity.
+				nLines := strings.Count(text, "\n") + 1
+				disp := fmt.Sprintf("[pasted %d lines]", nLines)
+				m.shiftEntities(m.cursor, len(text))
+				m.pasteEntities = append(m.pasteEntities, pasteEntity{
+					start:   m.cursor,
+					end:     m.cursor + len(text),
+					display: disp,
+				})
+				left := m.input[:m.cursor]
+				right := m.input[m.cursor:]
+				m.input = left + text + right
+				m.cursor += len(text)
+			} else {
+				m.shiftEntities(m.cursor, len(text))
+				left := m.input[:m.cursor]
+				right := m.input[m.cursor:]
+				m.input = left + text + right
+				m.cursor += len(text)
+				m.updateSlashSuggest()
+				m.updateAtSuggest()
+			}
 		}
 	}
 	return m, nil
@@ -614,6 +947,11 @@ func (m *model) View() string {
 		return m.renderDiffView()
 	}
 
+	// ── Session browser mode ─────────────────────────────────────────────────
+	if m.mode == modeSession {
+		return m.renderSessionBrowser()
+	}
+
 	// ── Chat mode ────────────────────────────────────────────────────────────
 	var b strings.Builder
 	rows := m.chatRows()
@@ -624,12 +962,44 @@ func (m *model) View() string {
 	if end > len(rendered) {
 		end = len(rendered)
 	}
+	selLo, selHi := m.selAnchor, m.selEnd
+	if selLo.row > selHi.row || (selLo.row == selHi.row && selLo.col > selHi.col) {
+		selLo, selHi = selHi, selLo
+	}
 	for i := m.scroll; i < end; i++ {
-		b.WriteString(rendered[i])
+		if (m.hasSel || m.selActive) && i >= selLo.row && i <= selHi.row {
+			plain := ansiEscRe.ReplaceAllString(rendered[i], "")
+			runes := []rune(plain)
+			n := len(runes)
+			startCol, endCol := 0, n
+			if i == selLo.row {
+				startCol = selLo.col
+			}
+			if i == selHi.row {
+				endCol = selHi.col
+			}
+			if startCol > n {
+				startCol = n
+			}
+			if endCol > n {
+				endCol = n
+			}
+			before := string(runes[:startCol])
+			sel := string(runes[startCol:endCol])
+			after := string(runes[endCol:])
+			b.WriteString(before + selStyle.Render(sel) + after)
+		} else {
+			b.WriteString(rendered[i])
+		}
 		b.WriteString("\n")
 	}
 	for i := end - m.scroll; i < rows; i++ {
 		b.WriteString("\n")
+	}
+
+	// @ file picker menu
+	if len(m.atSuggest) > 0 {
+		b.WriteString(m.renderAtMenu())
 	}
 
 	// Slash command menu (above files bar / status)
@@ -676,7 +1046,8 @@ func (m *model) View() string {
 	} else if strings.Contains(m.input, "\n") {
 		prompt = "│ "
 	}
-	inputLines := wrapInput(m.input, m.width-len(prompt)-2, m.cursor)
+	dispText, dispCursor := m.inputDisplay()
+	inputLines := wrapInput(dispText, m.width-len(prompt)-2, dispCursor)
 	for i, ln := range inputLines {
 		if i == 0 {
 			b.WriteString(inputStyle.Render(prompt + ln))
@@ -696,6 +1067,12 @@ func (m *model) submit() {
 	if prompt == "" {
 		return
 	}
+	if m.waitingContinue {
+		m.waitingContinue = false
+		if strings.ToLower(prompt) == "y" || strings.ToLower(prompt) == "yes" {
+			prompt = "continue"
+		}
+	}
 	
 	// Add to history
 	m.history = append(m.history, m.input)
@@ -706,8 +1083,11 @@ func (m *model) submit() {
 	
 	m.input = ""
 	m.cursor = 0
+	m.pasteEntities = nil
 	m.slashSuggest = nil
 	m.slashSelIdx = 0
+	m.atSuggest = nil
+	m.atSelIdx = 0
 	m.running = true
 	m.step++
 	m.spinner = 0
@@ -730,9 +1110,11 @@ func (m *model) submit() {
 	m.bumpCache()
 	m.scrollToBottom()
 
+	m.lastPrompt = prompt
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	before := append([]provider.Message(nil), m.messages[:len(m.messages)-1]...)
+	m.beforeMessages = before
 	cb := func(eventType string, data map[string]any) {
 		if m.program != nil {
 			m.program.Send(streamMsg{Event: eventType, Data: data})
@@ -770,6 +1152,16 @@ func (m *model) handleStream(msg streamMsg) {
 		name, _ := msg.Data["name"].(string)
 		m.lastTool = name
 		m.toolStatus = fmt.Sprintf("Completed %s", name)
+		if name == "bash" {
+			if input, ok := msg.Data["input"].(map[string]any); ok {
+				if cmd, _ := input["cmd"].(string); cmd != "" {
+					l := line{Kind: "tool", Text: "$ " + cmd}
+					m.lines = append(m.lines, l)
+					m.allToolLines = append(m.allToolLines, l)
+					m.bumpCache()
+				}
+			}
+		}
 		m.scrollToBottom()
 	case "file_change":
 		path, _ := msg.Data["path"].(string)
@@ -799,11 +1191,19 @@ func (m *model) handleStream(msg streamMsg) {
 			if speed < 2 {
 				speed = 2
 			}
+			hlLines := syntaxHighlightLines(strings.Join(lines, "\n"), filepath.Base(path))
+			for len(hlLines) < len(lines) {
+				hlLines = append(hlLines, "")
+			}
+			if len(hlLines) != len(lines) {
+				hlLines = lines
+			}
 			lineIdx := len(m.lines)
 			m.lines = append(m.lines, line{Kind: "reading", Text: path})
 			m.reading = &readingFile{
 				path:    path,
 				lines:   lines,
+				hlLines: hlLines,
 				cursor:  0,
 				speed:   speed,
 				lineIdx: lineIdx,
@@ -829,6 +1229,7 @@ func (m *model) replaceStreamingAssistant() {
 
 func (m *model) bumpCache() {
 	m.cacheDirty = true
+	m.lineHitsDirty = true
 }
 
 func (m *model) renderedLines() []string {
@@ -838,6 +1239,38 @@ func (m *model) renderedLines() []string {
 	m.lineCache = m.computeRenderedLines()
 	m.cacheDirty = false
 	return m.lineCache
+}
+
+func (m *model) cachedLineHits() []string {
+	if !m.lineHitsDirty && m.lineHits != nil {
+		return m.lineHits
+	}
+	m.lineHits = m.computeLineHits()
+	m.lineHitsDirty = false
+	return m.lineHits
+}
+
+func (m *model) computeLineHits() []string {
+	rendered := m.renderedLines()
+	hits := make([]string, len(rendered))
+	for i, rl := range rendered {
+		plain := ansiEscRe.ReplaceAllString(rl, "")
+		var candidates []string
+		for _, match := range backtickRe.FindAllStringSubmatch(plain, -1) {
+			candidates = append(candidates, match[1])
+		}
+		for _, p := range pathShapeRe.FindAllString(plain, -1) {
+			candidates = append(candidates, p)
+		}
+		for _, p := range candidates {
+			clean := strings.SplitN(p, ":", 2)[0]
+			if _, err := os.Stat(filepath.Join(m.cwd, clean)); err == nil {
+				hits[i] = clean
+				break
+			}
+		}
+	}
+	return hits
 }
 
 func (m *model) computeRenderedLines() []string {
@@ -932,50 +1365,148 @@ func renderDiff(diff *tools.DiffInfo, width int) []string {
 	header := fmt.Sprintf("━━━ %s %s ━━━", diff.Operation, diff.Path)
 	out = append(out, diffFileStyle.Render(header))
 
+	filename := filepath.Base(diff.Path)
+
 	if diff.IsNewFile {
 		out = append(out, diffAddMarkStyle.Render("+ new file"))
-		lines := diffSplitLines(diff.NewContent)
-		for i, ln := range lines {
+		plainLines := diffSplitLines(diff.NewContent)
+		hlLines := syntaxHighlightLines(diff.NewContent, filename)
+		if len(hlLines) != len(plainLines) {
+			hlLines = plainLines
+		}
+		for i, ln := range hlLines {
 			num := diffAddMarkStyle.Render(fmt.Sprintf("%4d", i+1))
 			plus := diffAddMarkStyle.Render(" + ")
-			code := diffCodeStyle.Render(ln)
-			out = append(out, num+plus+code)
+			out = append(out, num+plus+ln)
 		}
 	} else {
+		const contextLines = 3
+
 		oldLines := diffSplitLines(diff.OldContent)
 		newLines := diffSplitLines(diff.NewContent)
+		oldHL := syntaxHighlightLines(diff.OldContent, filename)
+		newHL := syntaxHighlightLines(diff.NewContent, filename)
+		if len(oldHL) != len(oldLines) {
+			oldHL = oldLines
+		}
+		if len(newHL) != len(newLines) {
+			newHL = newLines
+		}
 
-		// LCS-based alignment so inserted/removed lines render as actual
-		// add/remove rows instead of knocking every later line out of sync.
+		// LCS walk — build a full row list before emitting anything.
+		type drow struct {
+			kind    string // "ctx", "add", "rem"
+			oldNum  int
+			newNum  int
+			content string
+		}
+		var rows []drow
 		common := diffLCS(oldLines, newLines)
 		i, j, k := 0, 0, 0
 		for i < len(oldLines) || j < len(newLines) {
 			switch {
 			case k < len(common) && i < len(oldLines) && j < len(newLines) &&
 				oldLines[i] == common[k] && newLines[j] == common[k]:
-				num := diffLineNumStyle.Render(fmt.Sprintf("%4d", j+1))
-				out = append(out, num+"   "+newLines[j])
+				rows = append(rows, drow{"ctx", i + 1, j + 1, newHL[j]})
 				i++
 				j++
 				k++
 			case i < len(oldLines) && (k >= len(common) || oldLines[i] != common[k]):
-				num := diffRemMarkStyle.Render(fmt.Sprintf("%4d", i+1))
-				dash := diffRemMarkStyle.Render(" - ")
-				code := diffFadedStyle.Render(oldLines[i])
-				out = append(out, num+dash+code)
+				rows = append(rows, drow{"rem", i + 1, 0, diffLineBg(oldHL[i], "\x1b[48;5;236m")})
 				i++
 			default:
-				num := diffAddMarkStyle.Render(fmt.Sprintf("%4d", j+1))
-				plus := diffAddMarkStyle.Render(" + ")
-				code := diffCodeStyle.Render(newLines[j])
-				out = append(out, num+plus+code)
+				rows = append(rows, drow{"add", 0, j + 1, newHL[j]})
 				j++
+			}
+		}
+
+		// Mark rows within contextLines of any change as visible.
+		visible := make([]bool, len(rows))
+		for idx, r := range rows {
+			if r.kind != "ctx" {
+				lo := idx - contextLines
+				if lo < 0 {
+					lo = 0
+				}
+				hi := idx + contextLines
+				if hi >= len(rows) {
+					hi = len(rows) - 1
+				}
+				for x := lo; x <= hi; x++ {
+					visible[x] = true
+				}
+			}
+		}
+
+		// Emit hunks; insert an @@ header each time a new visible run starts.
+		inHunk := false
+		for idx, r := range rows {
+			if !visible[idx] {
+				inHunk = false
+				continue
+			}
+			if !inHunk {
+				ref := r.newNum
+				if ref == 0 {
+					ref = r.oldNum
+				}
+				out = append(out, diffFadedStyle.Render(fmt.Sprintf("@@ line %d @@", ref)))
+				inHunk = true
+			}
+			switch r.kind {
+			case "ctx":
+				num := diffLineNumStyle.Render(fmt.Sprintf("%4d", r.newNum))
+				out = append(out, num+"   "+r.content)
+			case "rem":
+				num := diffRemMarkStyle.Render(fmt.Sprintf("%4d", r.oldNum))
+				dash := diffRemMarkStyle.Render(" - ")
+				out = append(out, num+dash+r.content)
+			case "add":
+				num := diffAddMarkStyle.Render(fmt.Sprintf("%4d", r.newNum))
+				plus := diffAddMarkStyle.Render(" + ")
+				out = append(out, num+plus+r.content)
 			}
 		}
 	}
 
 	out = append(out, "")
 	return out
+}
+
+// syntaxHighlightLines runs content through chroma using the lexer matched to
+// filename and returns the output split into terminal-coloured lines.
+// Falls back to diffSplitLines on any error.
+func syntaxHighlightLines(content, filename string) []string {
+	content = strings.ReplaceAll(content, "\t", "    ")
+	lx := lexers.Match(filename)
+	if lx == nil {
+		lx = lexers.Fallback
+	}
+	lx = chroma.Coalesce(lx)
+	style := styles.Get("monokai")
+	if style == nil {
+		style = styles.Fallback
+	}
+	fmt := formatters.Get("terminal256")
+	if fmt == nil {
+		return diffSplitLines(content)
+	}
+	var buf bytes.Buffer
+	it, err := lx.Tokenise(nil, content)
+	if err != nil {
+		return diffSplitLines(content)
+	}
+	if err := fmt.Format(&buf, style, it); err != nil {
+		return diffSplitLines(content)
+	}
+	return diffSplitLines(buf.String())
+}
+
+// diffLineBg re-applies bgCode after every ANSI reset in s so a background
+// colour persists across chroma token boundaries.
+func diffLineBg(s, bgCode string) string {
+	const reset = "[0m"
+	return bgCode + strings.ReplaceAll(s, reset, reset+bgCode) + reset
 }
 
 // diffSplitLines normalizes CRLF/CR to LF and trims a single trailing newline
@@ -1059,14 +1590,17 @@ func renderReadingWindow(r *readingFile, width int) []string {
 
 	for i := start; i < end; i++ {
 		lineNum := fmt.Sprintf("%4d", i+1)
-		content := r.lines[i]
-		if len(content) > maxContent {
-			content = content[:maxContent]
+		hl := r.hlLines[i]
+		plain := r.lines[i]
+		if len(plain) > maxContent {
+			// truncate by rune count on the plain version; use plain as fallback
+			hl = plain[:maxContent]
+			plain = plain[:maxContent]
 		}
 		if i == r.cursor {
-			out = append(out, diffLineNumStyle.Render(lineNum)+" "+readCursorStyle.Render("► "+content))
+			out = append(out, diffLineNumStyle.Render(lineNum)+" "+readCursorStyle.Render("► ")+hl)
 		} else {
-			out = append(out, diffLineNumStyle.Render(lineNum)+"   "+readDimStyle.Render(content))
+			out = append(out, diffLineNumStyle.Render(lineNum)+"   "+hl)
 		}
 	}
 
@@ -1081,7 +1615,7 @@ func parseReadOutput(output string) []string {
 	var lines []string
 	for _, l := range strings.Split(output, "\n") {
 		if idx := strings.Index(l, "|"); idx >= 0 {
-			lines = append(lines, l[idx+1:])
+			lines = append(lines, strings.TrimRight(l[idx+1:], "\r"))
 		}
 	}
 	return lines
@@ -1127,6 +1661,75 @@ func wrapText(text string, width int) string {
 		lineLen += len(word)
 	}
 	return result.String()
+}
+
+// entityAt returns the index of the paste entity that strictly contains cursor
+// (start < cursor < end). Returns -1 if none.
+func (m *model) entityAt(cursor int) int {
+	for i, e := range m.pasteEntities {
+		if e.start < cursor && cursor < e.end {
+			return i
+		}
+	}
+	return -1
+}
+
+// entityEndingAt returns the index of the paste entity whose end equals cursor.
+// Returns -1 if none. Used by backspace to delete the entity atomically.
+func (m *model) entityEndingAt(cursor int) int {
+	for i, e := range m.pasteEntities {
+		if e.end == cursor {
+			return i
+		}
+	}
+	return -1
+}
+
+// shiftEntities adjusts the start/end of every paste entity whose start is >= from
+// by delta bytes. Call after inserting or deleting plain text at position from.
+func (m *model) shiftEntities(from, delta int) {
+	for i := range m.pasteEntities {
+		if m.pasteEntities[i].start >= from {
+			m.pasteEntities[i].start += delta
+			m.pasteEntities[i].end += delta
+		}
+	}
+}
+
+// inputDisplay returns the display version of m.input (entity ranges replaced with
+// their pill text) and the corresponding cursor position within that display string.
+func (m *model) inputDisplay() (string, int) {
+	if len(m.pasteEntities) == 0 {
+		return m.input, m.cursor
+	}
+	entities := make([]pasteEntity, len(m.pasteEntities))
+	copy(entities, m.pasteEntities)
+	sort.Slice(entities, func(i, j int) bool { return entities[i].start < entities[j].start })
+
+	var b strings.Builder
+	rawOff := 0
+	for _, e := range entities {
+		b.WriteString(m.input[rawOff:e.start])
+		b.WriteString(e.display)
+		rawOff = e.end
+	}
+	b.WriteString(m.input[rawOff:])
+	display := b.String()
+
+	// Map m.cursor (raw) → display cursor offset.
+	rawOff = 0
+	dispOff := 0
+	for _, e := range entities {
+		if m.cursor <= e.start {
+			return display, dispOff + (m.cursor - rawOff)
+		}
+		dispOff += (e.start - rawOff) + len(e.display)
+		rawOff = e.end
+		if m.cursor <= e.end {
+			return display, dispOff
+		}
+	}
+	return display, dispOff + (m.cursor - rawOff)
 }
 
 func wrapInput(text string, width int, cursor int) []string {
@@ -1263,6 +1866,7 @@ func (m *model) chatRows() int {
 		reserved++
 	}
 	reserved += m.slashMenuHeight()
+	reserved += m.atMenuHeight()
 	r := m.height - reserved
 	if r < 1 {
 		return 1
@@ -1290,6 +1894,114 @@ func (m *model) upsertChangedFile(d tools.DiffInfo) {
 		}
 	}
 	m.changedFiles = append(m.changedFiles, d)
+}
+
+// atFragmentAtCursor returns the start index and text of the @word immediately
+// before the cursor, or (-1, "") if the cursor is not inside an @fragment.
+func (m *model) atFragmentAtCursor() (start int, fragment string) {
+	left := m.input[:m.cursor]
+	at := strings.LastIndex(left, "@")
+	if at == -1 {
+		return -1, ""
+	}
+	frag := left[at+1:]
+	if strings.ContainsAny(frag, " \t\n") {
+		return -1, ""
+	}
+	return at, frag
+}
+
+// updateAtSuggest recomputes @ file suggestions from the current input.
+func (m *model) updateAtSuggest() {
+	start, frag := m.atFragmentAtCursor()
+	if start == -1 {
+		m.atSuggest = nil
+		m.atSelIdx = 0
+		return
+	}
+	if len(m.allFiles) == 0 {
+		m.loadAllFiles()
+	}
+	lower := strings.ToLower(frag)
+	prev := len(m.atSuggest)
+	m.atSuggest = m.atSuggest[:0]
+	for _, f := range m.allFiles {
+		if strings.Contains(strings.ToLower(f), lower) {
+			m.atSuggest = append(m.atSuggest, f)
+			if len(m.atSuggest) >= 50 {
+				break
+			}
+		}
+	}
+	if len(m.atSuggest) != prev {
+		m.atSelIdx = 0
+	}
+	if m.atSelIdx >= len(m.atSuggest) {
+		m.atSelIdx = 0
+	}
+}
+
+// loadAllFiles populates m.allFiles via rg --files in the project root.
+func (m *model) loadAllFiles() {
+	cmd := exec.Command("rg", "--files")
+	cmd.Dir = m.cwd
+	out, _ := cmd.Output()
+	if len(out) == 0 {
+		return
+	}
+	m.allFiles = strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+}
+
+// atCompleteSelected replaces the @fragment under the cursor with the selected path.
+func (m *model) atCompleteSelected() {
+	if len(m.atSuggest) == 0 {
+		return
+	}
+	start, _ := m.atFragmentAtCursor()
+	if start == -1 {
+		return
+	}
+	path := m.atSuggest[m.atSelIdx]
+	right := m.input[m.cursor:]
+	m.input = m.input[:start] + "@" + path + right
+	m.cursor = start + 1 + len(path)
+	m.atSuggest = nil
+	m.atSelIdx = 0
+}
+
+func (m *model) atMenuHeight() int {
+	n := len(m.atSuggest)
+	if n == 0 {
+		return 0
+	}
+	if n > 8 {
+		n = 8
+	}
+	return n + 1 // items + header line
+}
+
+func (m *model) renderAtMenu() string {
+	var b strings.Builder
+	n := len(m.atSuggest)
+	if n > 8 {
+		n = 8
+	}
+	header := slashMenuBorderStyle.Width(max(1, m.width)).Render(" files")
+	b.WriteString(header)
+	b.WriteString("\n")
+	for i := 0; i < n; i++ {
+		path := m.atSuggest[i]
+		dir := filepath.Dir(path)
+		base := filepath.Base(path)
+		label := slashArgStyle.Render(dir+string(filepath.Separator)) + slashCmdStyle.Render(base)
+		if i == m.atSelIdx {
+			b.WriteString(slashItemSelStyle.Width(max(1, m.width)).Render("▸ " + label))
+		} else {
+			b.WriteString(slashItemStyle.Width(max(1, m.width)).Render(label))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // updateSlashSuggest recomputes slash suggestions from the current input.
@@ -1399,6 +2111,22 @@ func (m *model) executeSlash(cmd string, args []string) {
 		m.streamText = ""
 		m.totalUsage = provider.Usage{}
 		m.bumpCache()
+
+	case "sessions":
+		list, err := store.ListSessions()
+		if err != nil {
+			m.lines = append(m.lines, line{Kind: "error", Text: "sessions: " + err.Error()})
+			m.bumpCache()
+			return
+		}
+		if len(list) == 0 {
+			m.lines = append(m.lines, line{Kind: "tool", Text: "no sessions found"})
+			m.bumpCache()
+			return
+		}
+		m.sessionList = list
+		m.sessionScroll = 0
+		m.mode = modeSession
 
 	default:
 		m.lines = append(m.lines, line{Kind: "error", Text: "unknown command: /" + cmd + "  (type /help)"})
@@ -1512,6 +2240,9 @@ func (m *model) renderDiffView() string {
 
 	// ── Hint bar ─────────────────────────────────────────────────────────────
 	hint := fmt.Sprintf(" ←/→ switch file  ↑/↓ scroll  Esc return   %s/%d", filepath.Base(diff.Path), len(m.changedFiles))
+	if m.diffTypingHint {
+		hint = " navigate mode — typing is disabled  ↑/↓ scroll  ←/→ switch file  Esc to return"
+	}
 	b.WriteString(diffHintStyle.Width(max(1, m.width)).Render(hint))
 
 	return b.String()
@@ -1594,5 +2325,80 @@ func (m *model) renderOnboarding() string {
 	b.WriteString("\n\n")
 	b.WriteString(normal.Render("Press Enter to continue..."))
 	
+	return b.String()
+}
+
+// renderSessionBrowser renders the full-screen session picker.
+func (m *model) renderSessionBrowser() string {
+	var b strings.Builder
+
+	header := sessionHeaderStyle.Width(m.width).Render(" sessions   ↑/↓ scroll · Enter load · Esc back")
+	b.WriteString(header)
+	b.WriteString("\n")
+
+	bodyRows := m.height - 2 // header + footer
+	if bodyRows < 1 {
+		bodyRows = 1
+	}
+
+	// Keep selected row visible: compute scroll offset.
+	start := m.sessionScroll - bodyRows/2
+	if start < 0 {
+		start = 0
+	}
+	if start+bodyRows > len(m.sessionList) {
+		start = len(m.sessionList) - bodyRows
+		if start < 0 {
+			start = 0
+		}
+	}
+	end := start + bodyRows
+	if end > len(m.sessionList) {
+		end = len(m.sessionList)
+	}
+
+	for i := start; i < end; i++ {
+		s := m.sessionList[i]
+		date := s.StartedAt.Format("2006-01-02 15:04")
+		mod := shortModel(s.Model)
+		if mod == s.Model {
+			runes := []rune(s.Model)
+			if len(runes) > 8 {
+				mod = string(runes[:8])
+			}
+		}
+		id := s.ID
+		if len([]rune(id)) > 26 {
+			id = string([]rune(id)[:26])
+		}
+		preview := s.Preview
+		if preview == "" {
+			preview = "(no messages)"
+		}
+		preview = strings.ReplaceAll(preview, "\n", " ")
+
+		row := fmt.Sprintf(" %-26s  %s  %-6s  %s", id, date, mod, preview)
+		runes := []rune(row)
+		if len(runes) > m.width {
+			row = string(runes[:m.width-1]) + "…"
+		}
+
+		if i == m.sessionScroll {
+			b.WriteString(sessionSelStyle.Width(m.width).Render(row))
+		} else {
+			b.WriteString(sessionRowStyle.Width(m.width).Render(row))
+		}
+		b.WriteString("\n")
+	}
+
+	// Pad remaining rows so the footer lands at the bottom.
+	for rendered := end - start; rendered < bodyRows; rendered++ {
+		b.WriteString(sessionRowStyle.Width(m.width).Render(""))
+		b.WriteString("\n")
+	}
+
+	footer := fmt.Sprintf(" %d / %d", m.sessionScroll+1, len(m.sessionList))
+	b.WriteString(sessionHeaderStyle.Width(m.width).Render(footer))
+
 	return b.String()
 }
