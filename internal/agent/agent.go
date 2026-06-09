@@ -48,12 +48,36 @@ Tools: read, bash, edit, write, memory_write, memory_search, web_search, web_fet
 
 Output: minimal. No filler. No "Great question". Reference code as file:line. Don't paste diffs. Don't create .md summaries.`
 
+// toolFormatGuide is appended to the persona for non-Claude providers (Kimi,
+// MiniMax, GLM, etc.). These models are far more sensitive to tool-call shape
+// than Claude — they routinely stringify array arguments or describe a call in
+// prose instead of emitting it. Spelling out the exact format with one concrete
+// example per mutating tool measurably improves compliance. Claude does not need
+// this, so it only ships in the compat persona.
+const toolFormatGuide = `## Tool-call format — follow exactly
+Emit every tool call as a structured tool_use. Never describe a call in prose, never wrap arguments in markdown, never send arguments as a quoted/stringified blob — they must be a real JSON object.
+
+- edit — "edits" is a JSON ARRAY of objects, not a string:
+  {"path":"main.go","edits":[{"old_text":"foo()","new_text":"bar()"}]}
+- write — full file content in "content":
+  {"path":"notes.md","content":"line one\nline two\n"}
+- bash — one command in "cmd":
+  {"cmd":"go test ./..."}
+
+Make one tool call at a time unless the calls are independent. After an edit or write, verify with bash. Never repeat a call that already succeeded.`
+
+// SYSTEM_PROMPT_COMPAT is the persona for weaker, format-sensitive providers. It
+// keeps the identical rubber-duck persona and only adds explicit tool-call
+// formatting guidance — the product behavior is unchanged, the model just gets
+// the extra scaffolding it needs to call tools correctly.
+const SYSTEM_PROMPT_COMPAT = SYSTEM_PROMPT + "\n\n" + toolFormatGuide
+
 type AgentConfig struct {
 	CWD      string
 	MaxSteps int
 	Session  *store.Session // nil = no logging
 	StreamCB provider.StreamCallback
-	Model    string          // empty = use Provider.DefaultModel()
+	Model    string            // empty = use Provider.DefaultModel()
 	Provider provider.Provider // nil = provider.Claude
 	// ConfirmTool, if set, is called before each mutating tool (bash/write/edit).
 	// Returning false blocks the call. nil = no gating.
@@ -230,10 +254,29 @@ var TOOLS = []provider.ToolSchema{
 	},
 }
 
-func BuildSystem(cwd string) string {
+// personaFor returns the static persona for a provider. The real Anthropic
+// endpoint gets the lean prompt; every other backend (Kimi, MiniMax, GLM, …)
+// gets the compat persona with explicit tool-call formatting. The result is a
+// pure constant per provider, so it stays a stable, cacheable prefix.
+func personaFor(p provider.Provider) string {
+	if p == nil || p == provider.Claude {
+		return SYSTEM_PROMPT
+	}
+	return SYSTEM_PROMPT_COMPAT
+}
+
+// BuildSystem assembles the system prompt as two parts joined by
+// provider.SystemCacheBreak: the static persona (cacheable across every turn)
+// and the volatile per-turn context (env, project instructions, repomap, rules,
+// memory). The Claude builder turns the marker into separate cache breakpoints
+// so a repomap refresh or a new rule no longer busts the persona cache.
+func BuildSystem(cwd string, p provider.Provider) string {
 	var b strings.Builder
-	b.WriteString(SYSTEM_PROMPT)
-	fmt.Fprintf(&b, "\n\nCurrent date: %s", time.Now().Format("2006-01-02"))
+	b.WriteString(personaFor(p))
+
+	// Everything below is volatile and goes after the cache break.
+	b.WriteString(provider.SystemCacheBreak)
+	fmt.Fprintf(&b, "Current date: %s", time.Now().Format("2006-01-02"))
 	fmt.Fprintf(&b, "\nCurrent working directory: %s", cwd)
 
 	if path, content := loadProjectContext(cwd); content != "" {
@@ -243,7 +286,7 @@ func BuildSystem(cwd string) string {
 	if repo := repomap.Cached(); repo != "" {
 		fmt.Fprintf(&b, "\n\n## Repository map\n%s", repo)
 	}
-	if rules := memory.LoadRules(cwd); rules != "" {
+	if rules := memory.LoadAllRules(cwd); rules != "" {
 		fmt.Fprintf(&b, "\n\n## Behavioral rules\n%s", rules)
 	}
 	if mem := memory.LoadMemory(cwd); mem != "" {
@@ -292,7 +335,7 @@ func AgentTurn(ctx context.Context, cfg AgentConfig, userMsg string, messages []
 		Content: []provider.ContentBlock{{Type: "text", Text: userMsg}},
 	})
 
-	system := BuildSystem(cfg.CWD)
+	system := BuildSystem(cfg.CWD, cfg.Provider)
 	model := cfg.Model
 	if model == "" {
 		model = cfg.Provider.DefaultModel()

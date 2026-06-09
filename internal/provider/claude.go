@@ -10,7 +10,20 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
+
+// httpClient is shared by both the Claude and OpenAI providers. It has no
+// overall timeout (streams run arbitrarily long) but caps how long we wait for
+// response headers, so a stalled connection fails fast instead of hanging until
+// the context is cancelled.
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ResponseHeaderTimeout: 120 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+	},
+}
 
 // apiBase is the Anthropic Messages endpoint. Overridden in tests.
 var apiBase = "https://api.anthropic.com/v1/messages"
@@ -181,10 +194,23 @@ func marshalBlocks(blocks []apiContentBlock) json.RawMessage {
 }
 
 func buildRequest(messages []Message, system string, tools []ToolSchema, model string, stream bool) requestBody {
-	// System: single block marked ephemeral.
+	// System: split on the cache-break marker into separate blocks so the static
+	// persona prefix and the volatile context get independent cache breakpoints —
+	// the persona stays cached across every turn, and the context caches whenever
+	// only the conversation (not repomap/rules/memory) changed. With no marker
+	// this collapses to a single ephemeral block, identical to before.
 	var sysBlocks []apiSystemBlock
 	if system != "" {
-		sysBlocks = []apiSystemBlock{{Type: "text", Text: system, CacheControl: ephemeral}}
+		for _, part := range strings.Split(system, SystemCacheBreak) {
+			if part == "" {
+				continue
+			}
+			sysBlocks = append(sysBlocks, apiSystemBlock{Type: "text", Text: part})
+		}
+		if len(sysBlocks) > 0 {
+			sysBlocks[0].CacheControl = ephemeral
+			sysBlocks[len(sysBlocks)-1].CacheControl = ephemeral
+		}
 	}
 
 	// Tools: last one marked ephemeral.
@@ -262,7 +288,49 @@ func sendRequest(ctx context.Context, body requestBody, baseURL, envKeyName stri
 		req.Header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")
 	}
 
-	return http.DefaultClient.Do(req)
+	return httpClient.Do(req)
+}
+
+// transientStatus reports whether an HTTP status is worth retrying: rate limits
+// (429), Anthropic overload (529), and 5xx server errors are transient.
+func transientStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code == 529 || code >= 500
+}
+
+// sendRequestRetry wraps sendRequest with bounded exponential backoff for
+// transient connection failures and transient HTTP statuses. It only retries
+// before any response body is consumed, so it is safe for both the streaming
+// and non-streaming paths (a mid-stream drop is handled separately — we cannot
+// replay a stream whose deltas already reached the UI).
+func sendRequestRetry(ctx context.Context, body requestBody, baseURL, envKeyName string) (*http.Response, error) {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(400<<(attempt-1)) * time.Millisecond // 400ms, 800ms
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		resp, err := sendRequest(ctx, body, baseURL, envKeyName)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			lastErr = err
+			continue
+		}
+		if transientStatus(resp.StatusCode) {
+			raw, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("API %d: %s", resp.StatusCode, readAPIError(raw))
+			continue
+		}
+		return resp, nil
+	}
+	return nil, lastErr
 }
 
 func toUsage(au apiUsage) Usage {
@@ -287,7 +355,7 @@ func readAPIError(body []byte) string {
 func callClaudeWith(ctx context.Context, messages []Message, system string, tools []ToolSchema, model, baseURL, envKeyName string) (Message, Usage, error) {
 	req := buildRequest(messages, system, tools, model, false)
 
-	resp, err := sendRequest(ctx, req, baseURL, envKeyName)
+	resp, err := sendRequestRetry(ctx, req, baseURL, envKeyName)
 	if err != nil {
 		return Message{}, Usage{}, fmt.Errorf("send: %w", err)
 	}
@@ -367,7 +435,7 @@ type streamBlock struct {
 func callClaudeStreamingWith(ctx context.Context, messages []Message, system string, tools []ToolSchema, model, baseURL, envKeyName string, cb StreamCallback) (Message, Usage, error) {
 	req := buildRequest(messages, system, tools, model, true)
 
-	resp, err := sendRequest(ctx, req, baseURL, envKeyName)
+	resp, err := sendRequestRetry(ctx, req, baseURL, envKeyName)
 	if err != nil {
 		return Message{}, Usage{}, fmt.Errorf("send: %w", err)
 	}
@@ -382,126 +450,141 @@ func callClaudeStreamingWith(ctx context.Context, messages []Message, system str
 	var blockOrder []int
 	var usage Usage
 	var stopReason string
+	completed := false // set once we see the terminal message_stop
 
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 256*1024), 256*1024)
+	// bufio.Reader (not Scanner) so a single oversized SSE line can't trip a
+	// fixed token cap and silently truncate the turn.
+	reader := bufio.NewReaderSize(resp.Body, 64*1024)
+	var readErr error
 
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := line[6:]
-		if payload == "[DONE]" {
-			break
-		}
-
-		var evt map[string]any
-		if err := json.Unmarshal([]byte(payload), &evt); err != nil {
-			continue
-		}
-
-		switch evtType, _ := evt["type"].(string); evtType {
-
-		case "message_start":
-			if msg, ok := evt["message"].(map[string]any); ok {
-				if u, ok := msg["usage"].(map[string]any); ok {
-					usage.InputTokens = jsonInt(u, "input_tokens")
-					usage.CacheWrite = jsonInt(u, "cache_creation_input_tokens")
-					usage.CacheRead = jsonInt(u, "cache_read_input_tokens")
-				}
-			}
-
-		case "content_block_start":
-			idx := jsonInt(evt, "index")
-			cbData, _ := evt["content_block"].(map[string]any)
-			btype, _ := cbData["type"].(string)
-
-			blk := &streamBlock{btype: btype}
-			switch btype {
-			case "tool_use":
-				blk.id, _ = cbData["id"].(string)
-				blk.name, _ = cbData["name"].(string)
-			case "redacted_thinking":
-				blk.data, _ = cbData["data"].(string)
-			}
-			blockMap[idx] = blk
-			blockOrder = append(blockOrder, idx)
-
-			if cb != nil {
-				switch btype {
-				case "text":
-					cb(TextStart, map[string]any{"index": idx})
-				case "thinking":
-					cb(ThinkingStart, map[string]any{"index": idx})
-				case "tool_use":
-					cb(ToolStart, map[string]any{"index": idx, "id": blk.id, "name": blk.name})
-				}
-			}
-
-		case "content_block_delta":
-			idx := jsonInt(evt, "index")
-			blk := blockMap[idx]
-			if blk == nil {
-				continue
-			}
-			delta, _ := evt["delta"].(map[string]any)
-			deltaType, _ := delta["type"].(string)
-
-			switch deltaType {
-			case "text_delta":
-				text, _ := delta["text"].(string)
-				blk.text.WriteString(text)
-				if cb != nil {
-					cb(TextDelta, map[string]any{"index": idx, "text": text})
-				}
-			case "thinking_delta":
-				thinking, _ := delta["thinking"].(string)
-				blk.text.WriteString(thinking)
-				if cb != nil {
-					cb(ThinkingDelta, map[string]any{"index": idx, "text": thinking})
-				}
-			case "signature_delta":
-				sig, _ := delta["signature"].(string)
-				blk.sig.WriteString(sig)
-			case "input_json_delta":
-				partial, _ := delta["partial_json"].(string)
-				blk.jsonBuf.WriteString(partial)
-			}
-
-		case "content_block_stop":
-			idx := jsonInt(evt, "index")
-			blk := blockMap[idx]
-			if blk == nil || blk.btype != "tool_use" {
+	for {
+		raw, rerr := reader.ReadString('\n')
+		if line := strings.TrimRight(raw, "\r\n"); strings.HasPrefix(line, "data: ") {
+			payload := line[6:]
+			if payload == "[DONE]" {
+				completed = true
 				break
 			}
-			if cb != nil {
-				var input map[string]any
-				if blk.jsonBuf.Len() > 0 {
-					json.Unmarshal([]byte(blk.jsonBuf.String()), &input) //nolint:errcheck
-				}
-				cb(ToolComplete, map[string]any{"index": idx, "id": blk.id, "name": blk.name, "input": input})
-			}
 
-		case "message_delta":
-			if u, ok := evt["usage"].(map[string]any); ok {
-				usage.OutputTokens = jsonInt(u, "output_tokens")
-			}
-			if d, ok := evt["delta"].(map[string]any); ok {
-				if sr, _ := d["stop_reason"].(string); sr != "" {
-					stopReason = sr
+			var evt map[string]any
+			if json.Unmarshal([]byte(payload), &evt) == nil {
+				switch evtType, _ := evt["type"].(string); evtType {
+
+				case "message_start":
+					if msg, ok := evt["message"].(map[string]any); ok {
+						if u, ok := msg["usage"].(map[string]any); ok {
+							usage.InputTokens = jsonInt(u, "input_tokens")
+							usage.CacheWrite = jsonInt(u, "cache_creation_input_tokens")
+							usage.CacheRead = jsonInt(u, "cache_read_input_tokens")
+						}
+					}
+
+				case "content_block_start":
+					idx := jsonInt(evt, "index")
+					cbData, _ := evt["content_block"].(map[string]any)
+					btype, _ := cbData["type"].(string)
+
+					blk := &streamBlock{btype: btype}
+					switch btype {
+					case "tool_use":
+						blk.id, _ = cbData["id"].(string)
+						blk.name, _ = cbData["name"].(string)
+					case "redacted_thinking":
+						blk.data, _ = cbData["data"].(string)
+					}
+					blockMap[idx] = blk
+					blockOrder = append(blockOrder, idx)
+
+					if cb != nil {
+						switch btype {
+						case "text":
+							cb(TextStart, map[string]any{"index": idx})
+						case "thinking":
+							cb(ThinkingStart, map[string]any{"index": idx})
+						case "tool_use":
+							cb(ToolStart, map[string]any{"index": idx, "id": blk.id, "name": blk.name})
+						}
+					}
+
+				case "content_block_delta":
+					idx := jsonInt(evt, "index")
+					blk := blockMap[idx]
+					if blk == nil {
+						continue
+					}
+					delta, _ := evt["delta"].(map[string]any)
+					deltaType, _ := delta["type"].(string)
+
+					switch deltaType {
+					case "text_delta":
+						text, _ := delta["text"].(string)
+						blk.text.WriteString(text)
+						if cb != nil {
+							cb(TextDelta, map[string]any{"index": idx, "text": text})
+						}
+					case "thinking_delta":
+						thinking, _ := delta["thinking"].(string)
+						blk.text.WriteString(thinking)
+						if cb != nil {
+							cb(ThinkingDelta, map[string]any{"index": idx, "text": thinking})
+						}
+					case "signature_delta":
+						sig, _ := delta["signature"].(string)
+						blk.sig.WriteString(sig)
+					case "input_json_delta":
+						partial, _ := delta["partial_json"].(string)
+						blk.jsonBuf.WriteString(partial)
+					}
+
+				case "content_block_stop":
+					idx := jsonInt(evt, "index")
+					blk := blockMap[idx]
+					if blk == nil || blk.btype != "tool_use" {
+						break
+					}
+					if cb != nil {
+						var input map[string]any
+						if blk.jsonBuf.Len() > 0 {
+							json.Unmarshal([]byte(blk.jsonBuf.String()), &input) //nolint:errcheck
+						}
+						cb(ToolComplete, map[string]any{"index": idx, "id": blk.id, "name": blk.name, "input": input})
+					}
+
+				case "message_delta":
+					if u, ok := evt["usage"].(map[string]any); ok {
+						usage.OutputTokens = jsonInt(u, "output_tokens")
+					}
+					if d, ok := evt["delta"].(map[string]any); ok {
+						if sr, _ := d["stop_reason"].(string); sr != "" {
+							stopReason = sr
+						}
+					}
+
+				case "message_stop":
+					completed = true
+					if cb != nil {
+						cb("message_stop", map[string]any{})
+					}
 				}
 			}
+		}
 
-		case "message_stop":
-			if cb != nil {
-				cb("message_stop", map[string]any{})
+		if rerr != nil {
+			if rerr != io.EOF {
+				readErr = rerr
 			}
+			break
 		}
 	}
 
-	if err := sc.Err(); err != nil && ctx.Err() == nil {
-		return Message{}, usage, fmt.Errorf("stream read: %w", err)
+	if readErr != nil && ctx.Err() == nil {
+		return Message{}, usage, fmt.Errorf("stream read: %w", readErr)
+	}
+	// A stream that ends without a terminal message_stop is a dropped/half-closed
+	// connection, not a finished turn. Returning the partial as success is exactly
+	// the silent truncation we want to avoid, so surface it as an error instead.
+	if !completed && ctx.Err() == nil {
+		return Message{}, usage, fmt.Errorf("stream ended before completion (connection dropped); retry the turn")
 	}
 
 	// Assemble final message in block order, deduplicating.
