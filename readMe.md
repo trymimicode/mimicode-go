@@ -10,6 +10,7 @@ It is not a pair programmer. It does not make decisions for you. It is a tool, i
 
 > still beta. feedback appreciated.
 
+handle support mimi@mimicode.xyz
 ---
 
 ## install
