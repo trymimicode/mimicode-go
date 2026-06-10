@@ -1317,41 +1317,16 @@ func (m *model) computeRenderedLines() []string {
 				}
 			}
 		case "assistant_stream":
-			// Don't run glamour on incomplete streaming text — it mangles partial markdown.
-			// Do a lightweight pass to render headers and plain text.
-			lines := strings.Split(l.Text, "\n")
+			rendered := renderMarkdown(l.Text, m.width)
+			rendered = strings.TrimLeft(rendered, "\n")
+			streamLines := strings.Split(rendered, "\n")
 			dotPlaced := false
-			for _, physical := range lines {
-				trimmed := strings.TrimSpace(physical)
-				if strings.HasPrefix(trimmed, "#") {
-					// Count leading # chars to determine heading level
-					level := 0
-					for _, ch := range trimmed {
-						if ch == '#' {
-							level++
-						} else {
-							break
-						}
-					}
-					text := strings.TrimSpace(trimmed[level:])
-					prefix := strings.Repeat("─", level) + " "
-					rendered := streamHeadStyle.Render(prefix + text)
-					if !dotPlaced {
-						out = append(out, assistantStyle.Render("● ")+rendered)
-						dotPlaced = true
-					} else {
-						out = append(out, rendered)
-					}
-					continue
-				}
-				wrapped := wrapText(physical, m.width-2)
-				for _, wl := range strings.Split(wrapped, "\n") {
-					if !dotPlaced && strings.TrimSpace(wl) != "" {
-						out = append(out, assistantStyle.Render("● ")+wl)
-						dotPlaced = true
-					} else {
-						out = append(out, wl)
-					}
+			for _, physical := range streamLines {
+				if !dotPlaced && strings.TrimSpace(physical) != "" {
+					out = append(out, assistantStyle.Render("● ")+physical)
+					dotPlaced = true
+				} else {
+					out = append(out, physical)
 				}
 			}
 		case "diff":
