@@ -96,9 +96,10 @@ type model struct {
 	cwd      string
 	messages []provider.Message
 	lines    []line
-	input    string
-	scroll   int
-	width    int
+	input        string
+	scroll       int
+	userScrolled bool
+	width         int
 	height   int
 	cursor   int
 
@@ -411,6 +412,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.scroll -= 3
 				m.clampScroll()
+				m.userScrolled = true
 			}
 		}
 		if msg.Button == tea.MouseButtonWheelDown {
@@ -419,6 +421,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.scroll += 3
 				m.clampScroll()
+				if m.isAtBottom() {
+					m.userScrolled = false
+				}
 			}
 		}
 	}
@@ -849,9 +854,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			} else if m.scroll > 0 {
 				m.scroll--
+				m.userScrolled = true
 			}
 		} else if m.scroll > 0 {
 			m.scroll--
+			m.userScrolled = true
 		}
 
 	case tea.KeyDown:
@@ -892,19 +899,29 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.scroll++
 				m.clampScroll()
+				if m.isAtBottom() {
+					m.userScrolled = false
+				}
 			}
 		} else {
 			m.scroll++
 			m.clampScroll()
+			if m.isAtBottom() {
+				m.userScrolled = false
+			}
 		}
 
 	case tea.KeyPgUp:
 		m.scroll -= m.chatRows()
 		m.clampScroll()
+		m.userScrolled = true
 
 	case tea.KeyPgDown:
 		m.scroll += m.chatRows()
 		m.clampScroll()
+		if m.isAtBottom() {
+			m.userScrolled = false
+		}
 
 	case tea.KeyTab:
 		if !m.running {
@@ -1176,6 +1193,7 @@ func (m *model) submit() {
 	})
 	m.lines = append(m.lines, line{Kind: "user", Text: prompt})
 	m.bumpCache()
+	m.userScrolled = false
 	m.scrollToBottom()
 
 	m.lastPrompt = prompt
@@ -1292,10 +1310,12 @@ func (m *model) replaceStreamingAssistant() {
 	if m.streamText == "" {
 		return
 	}
-	if len(m.lines) > 0 && m.lines[len(m.lines)-1].Kind == "assistant_stream" {
-		m.lines[len(m.lines)-1].Text = m.streamText
-		m.bumpCache()
-		return
+	for i := len(m.lines) - 1; i >= 0; i-- {
+		if m.lines[i].Kind == "assistant_stream" {
+			m.lines[i].Text = m.streamText
+			m.bumpCache()
+			return
+		}
 	}
 	m.lines = append(m.lines, line{Kind: "assistant_stream", Text: m.streamText})
 	m.bumpCache()
@@ -1371,41 +1391,16 @@ func (m *model) computeRenderedLines() []string {
 				}
 			}
 		case "assistant_stream":
-			// Don't run glamour on incomplete streaming text — it mangles partial markdown.
-			// Do a lightweight pass to render headers and plain text.
-			lines := strings.Split(l.Text, "\n")
+			rendered := renderMarkdown(l.Text, m.width)
+			rendered = strings.TrimLeft(rendered, "\n")
+			streamLines := strings.Split(rendered, "\n")
 			dotPlaced := false
-			for _, physical := range lines {
-				trimmed := strings.TrimSpace(physical)
-				if strings.HasPrefix(trimmed, "#") {
-					// Count leading # chars to determine heading level
-					level := 0
-					for _, ch := range trimmed {
-						if ch == '#' {
-							level++
-						} else {
-							break
-						}
-					}
-					text := strings.TrimSpace(trimmed[level:])
-					prefix := strings.Repeat("─", level) + " "
-					rendered := streamHeadStyle.Render(prefix + text)
-					if !dotPlaced {
-						out = append(out, assistantStyle.Render("● ")+rendered)
-						dotPlaced = true
-					} else {
-						out = append(out, rendered)
-					}
-					continue
-				}
-				wrapped := wrapText(physical, m.width-2)
-				for _, wl := range strings.Split(wrapped, "\n") {
-					if !dotPlaced && strings.TrimSpace(wl) != "" {
-						out = append(out, assistantStyle.Render("● ")+wl)
-						dotPlaced = true
-					} else {
-						out = append(out, wl)
-					}
+			for _, physical := range streamLines {
+				if !dotPlaced && strings.TrimSpace(physical) != "" {
+					out = append(out, assistantStyle.Render("● ")+physical)
+					dotPlaced = true
+				} else {
+					out = append(out, physical)
 				}
 			}
 		case "diff":
@@ -1702,6 +1697,7 @@ func renderMarkdown(text string, width int) string {
 	}
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStandardStyle("dark"),
+		glamour.WithStylesFromJSONBytes([]byte(`{"code":{"prefix":" ","suffix":" ","color":"75","background_color":null},"code_block":{"chroma":{"error":{"color":"#7AABFF","background_color":null}}}}`)),
 		glamour.WithWordWrap(w),
 	)
 	if err != nil {
@@ -1875,7 +1871,19 @@ func (m *model) clampScroll() {
 	}
 }
 
+func (m *model) isAtBottom() bool {
+	rendered := m.renderedLines()
+	maxScroll := len(rendered) - m.chatRows()
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	return m.scroll >= maxScroll
+}
+
 func (m *model) scrollToBottom() {
+	if m.userScrolled {
+		return
+	}
 	rendered := m.renderedLines()
 	m.scroll = len(rendered) - m.chatRows()
 	m.clampScroll()
