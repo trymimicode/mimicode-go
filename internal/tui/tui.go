@@ -1218,10 +1218,12 @@ func (m *model) replaceStreamingAssistant() {
 	if m.streamText == "" {
 		return
 	}
-	if len(m.lines) > 0 && m.lines[len(m.lines)-1].Kind == "assistant_stream" {
-		m.lines[len(m.lines)-1].Text = m.streamText
-		m.bumpCache()
-		return
+	for i := len(m.lines) - 1; i >= 0; i-- {
+		if m.lines[i].Kind == "assistant_stream" {
+			m.lines[i].Text = m.streamText
+			m.bumpCache()
+			return
+		}
 	}
 	m.lines = append(m.lines, line{Kind: "assistant_stream", Text: m.streamText})
 	m.bumpCache()
@@ -1628,6 +1630,7 @@ func renderMarkdown(text string, width int) string {
 	}
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStandardStyle("dark"),
+		glamour.WithStylesFromJSONBytes([]byte(`{"code":{"prefix":" ","suffix":" ","color":"75","background_color":null}}`)),
 		glamour.WithWordWrap(w),
 	)
 	if err != nil {
