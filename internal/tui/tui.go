@@ -94,9 +94,10 @@ type model struct {
 	cwd      string
 	messages []provider.Message
 	lines    []line
-	input    string
-	scroll   int
-	width    int
+	input        string
+	scroll       int
+	userScrolled bool
+	width         int
 	height   int
 	cursor   int
 
@@ -392,6 +393,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.scroll -= 3
 				m.clampScroll()
+				m.userScrolled = true
 			}
 		}
 		if msg.Button == tea.MouseButtonWheelDown {
@@ -400,6 +402,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.scroll += 3
 				m.clampScroll()
+				if m.isAtBottom() {
+					m.userScrolled = false
+				}
 			}
 		}
 	}
@@ -789,9 +794,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			} else if m.scroll > 0 {
 				m.scroll--
+				m.userScrolled = true
 			}
 		} else if m.scroll > 0 {
 			m.scroll--
+			m.userScrolled = true
 		}
 
 	case tea.KeyDown:
@@ -832,19 +839,29 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.scroll++
 				m.clampScroll()
+				if m.isAtBottom() {
+					m.userScrolled = false
+				}
 			}
 		} else {
 			m.scroll++
 			m.clampScroll()
+			if m.isAtBottom() {
+				m.userScrolled = false
+			}
 		}
 
 	case tea.KeyPgUp:
 		m.scroll -= m.chatRows()
 		m.clampScroll()
+		m.userScrolled = true
 
 	case tea.KeyPgDown:
 		m.scroll += m.chatRows()
 		m.clampScroll()
+		if m.isAtBottom() {
+			m.userScrolled = false
+		}
 
 	case tea.KeyTab:
 		if !m.running {
@@ -1108,6 +1125,7 @@ func (m *model) submit() {
 	})
 	m.lines = append(m.lines, line{Kind: "user", Text: prompt})
 	m.bumpCache()
+	m.userScrolled = false
 	m.scrollToBottom()
 
 	m.lastPrompt = prompt
@@ -1630,7 +1648,7 @@ func renderMarkdown(text string, width int) string {
 	}
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStandardStyle("dark"),
-		glamour.WithStylesFromJSONBytes([]byte(`{"code":{"prefix":" ","suffix":" ","color":"75","background_color":null}}`)),
+		glamour.WithStylesFromJSONBytes([]byte(`{"code":{"prefix":" ","suffix":" ","color":"75","background_color":null},"code_block":{"chroma":{"error":{"color":"#7AABFF","background_color":null}}}}`)),
 		glamour.WithWordWrap(w),
 	)
 	if err != nil {
@@ -1804,7 +1822,19 @@ func (m *model) clampScroll() {
 	}
 }
 
+func (m *model) isAtBottom() bool {
+	rendered := m.renderedLines()
+	maxScroll := len(rendered) - m.chatRows()
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	return m.scroll >= maxScroll
+}
+
 func (m *model) scrollToBottom() {
+	if m.userScrolled {
+		return
+	}
 	rendered := m.renderedLines()
 	m.scroll = len(rendered) - m.chatRows()
 	m.clampScroll()
