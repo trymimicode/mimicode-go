@@ -636,7 +636,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.scrollToBottom()
 			}
 		}
-
+	}
 
 	// ── Provider picker mode ──────────────────────────────────────────────────
 	if m.mode == modeProviderPicker {
