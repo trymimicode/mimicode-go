@@ -37,9 +37,9 @@ type streamMsg struct {
 }
 
 type turnDoneMsg struct {
-	Messages   []provider.Message
-	Err        error
-	Usage      provider.Usage
+	Messages []provider.Message
+	Err      error
+	Usage    provider.Usage
 	RetryCount int
 }
 
@@ -99,9 +99,10 @@ type model struct {
 	cwd      string
 	messages []provider.Message
 	lines    []line
-	input    string
-	scroll   int
-	width    int
+	input        string
+	scroll       int
+	userScrolled bool
+	width         int
 	height   int
 	cursor   int
 
@@ -298,26 +299,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.allToolLines = append(m.allToolLines, summary)
 			m.reading = nil
 		}
-		// Flush any pending streamText before touching streaming lines.
-		m.replaceStreamingAssistant()
-		// Decide whether this turn will be retried before touching streaming lines.
-		_, isStuckCheck := agent.IsStuck(msg.Err)
-		willRetry := msg.Err != nil && !isStuckCheck && msg.RetryCount < 5
-		if willRetry {
-			// Strip partial streaming lines — the retry will render a fresh stream.
-			filtered := m.lines[:0]
-			for _, l := range m.lines {
-				if l.Kind != "assistant_stream" {
-					filtered = append(filtered, l)
-				}
-			}
-			m.lines = filtered
-		} else {
-			// Promote streaming assistant lines to permanent (triggers full glamour render).
-			for i, l := range m.lines {
-				if l.Kind == "assistant_stream" {
-					m.lines[i].Kind = "assistant"
-				}
+		// Promote streaming assistant lines to permanent (triggers full glamour render).
+		for i, l := range m.lines {
+			if l.Kind == "assistant_stream" {
+				m.lines[i].Kind = "assistant"
 			}
 		}
 		m.running = false
@@ -368,36 +353,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}, retryPrompt, beforeMsgs)
 					if m.program != nil {
 						m.program.Send(turnDoneMsg{Messages: next, Err: err, Usage: provider.LastUsage()})
-					}
-				}()
-			} else if msg.RetryCount < 5 {
-				m.lines = append(m.lines, line{Kind: "tool", Text: fmt.Sprintf("stream dropped, retrying (%d/5)…", msg.RetryCount+1)})
-				m.running = true
-				ctx, cancel := context.WithCancel(context.Background())
-				m.cancel = cancel
-				sess := m.session
-				cwd := m.cwd
-				modelName := m.modelName
-				providerOverride := m.providerOverride
-				lastPrompt := m.lastPrompt
-				beforeMsgs := m.beforeMessages
-				retryCount := msg.RetryCount
-				cb := func(eventType string, data map[string]any) {
-					if m.program != nil {
-						m.program.Send(streamMsg{Event: eventType, Data: data})
-					}
-				}
-				go func() {
-					next, err := agent.AgentTurn(ctx, agent.AgentConfig{
-						CWD:      cwd,
-						Session:  sess,
-						MaxSteps: 25,
-						StreamCB: cb,
-						Model:    modelName,
-						Provider: providerOverride,
-					}, lastPrompt, beforeMsgs)
-					if m.program != nil {
-						m.program.Send(turnDoneMsg{Messages: next, Err: err, Usage: provider.LastUsage(), RetryCount: retryCount + 1})
 					}
 				}()
 			} else {
@@ -468,6 +423,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.scroll -= 3
 				m.clampScroll()
+				m.userScrolled = true
 			}
 		}
 		if msg.Button == tea.MouseButtonWheelDown {
@@ -476,6 +432,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.scroll += 3
 				m.clampScroll()
+				if m.isAtBottom() {
+					m.userScrolled = false
+				}
 			}
 		}
 	}
@@ -677,10 +636,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.scrollToBottom()
 			}
 		}
-		return m, nil
-	}
 
-	// ── Provider picker mode ─────────────────────────────────────────────────
+
+	// ── Provider picker mode ──────────────────────────────────────────────────
 	if m.mode == modeProviderPicker {
 		switch msg.Type {
 		case tea.KeyCtrlD:
@@ -715,7 +673,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// ── Model picker mode ────────────────────────────────────────────────────
+	// ── Model picker mode ──────────────────────────────────────────────────
 	if m.mode == modeModelPicker {
 		switch msg.Type {
 		case tea.KeyCtrlD:
@@ -749,6 +707,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+
 
 	// ── Files bar focused ────────────────────────────────────────────────────
 	if m.fileBarFocus {
@@ -976,9 +935,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			} else if m.scroll > 0 {
 				m.scroll--
+				m.userScrolled = true
 			}
 		} else if m.scroll > 0 {
 			m.scroll--
+			m.userScrolled = true
 		}
 
 	case tea.KeyDown:
@@ -1019,19 +980,29 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.scroll++
 				m.clampScroll()
+				if m.isAtBottom() {
+					m.userScrolled = false
+				}
 			}
 		} else {
 			m.scroll++
 			m.clampScroll()
+			if m.isAtBottom() {
+				m.userScrolled = false
+			}
 		}
 
 	case tea.KeyPgUp:
 		m.scroll -= m.chatRows()
 		m.clampScroll()
+		m.userScrolled = true
 
 	case tea.KeyPgDown:
 		m.scroll += m.chatRows()
 		m.clampScroll()
+		if m.isAtBottom() {
+			m.userScrolled = false
+		}
 
 	case tea.KeyTab:
 		if !m.running {
@@ -1141,9 +1112,11 @@ func (m *model) View() string {
 	if m.mode == modeSession {
 		return m.renderSessionBrowser()
 	}
+
 	if m.mode == modeProviderPicker {
 		return m.renderProviderPicker()
 	}
+
 	if m.mode == modeModelPicker {
 		return m.renderModelPicker()
 	}
@@ -1309,6 +1282,7 @@ func (m *model) submit() {
 	})
 	m.lines = append(m.lines, line{Kind: "user", Text: prompt})
 	m.bumpCache()
+	m.userScrolled = false
 	m.scrollToBottom()
 
 	m.lastPrompt = prompt
@@ -1425,10 +1399,12 @@ func (m *model) replaceStreamingAssistant() {
 	if m.streamText == "" {
 		return
 	}
-	if len(m.lines) > 0 && m.lines[len(m.lines)-1].Kind == "assistant_stream" {
-		m.lines[len(m.lines)-1].Text = m.streamText
-		m.bumpCache()
-		return
+	for i := len(m.lines) - 1; i >= 0; i-- {
+		if m.lines[i].Kind == "assistant_stream" {
+			m.lines[i].Text = m.streamText
+			m.bumpCache()
+			return
+		}
 	}
 	m.lines = append(m.lines, line{Kind: "assistant_stream", Text: m.streamText})
 	m.bumpCache()
@@ -1504,41 +1480,16 @@ func (m *model) computeRenderedLines() []string {
 				}
 			}
 		case "assistant_stream":
-			// Don't run glamour on incomplete streaming text — it mangles partial markdown.
-			// Do a lightweight pass to render headers and plain text.
-			lines := strings.Split(l.Text, "\n")
+			rendered := renderMarkdown(l.Text, m.width)
+			rendered = strings.TrimLeft(rendered, "\n")
+			streamLines := strings.Split(rendered, "\n")
 			dotPlaced := false
-			for _, physical := range lines {
-				trimmed := strings.TrimSpace(physical)
-				if strings.HasPrefix(trimmed, "#") {
-					// Count leading # chars to determine heading level
-					level := 0
-					for _, ch := range trimmed {
-						if ch == '#' {
-							level++
-						} else {
-							break
-						}
-					}
-					text := strings.TrimSpace(trimmed[level:])
-					prefix := strings.Repeat("─", level) + " "
-					rendered := streamHeadStyle.Render(prefix + text)
-					if !dotPlaced {
-						out = append(out, assistantStyle.Render("● ")+rendered)
-						dotPlaced = true
-					} else {
-						out = append(out, rendered)
-					}
-					continue
-				}
-				wrapped := wrapText(physical, m.width-2)
-				for _, wl := range strings.Split(wrapped, "\n") {
-					if !dotPlaced && strings.TrimSpace(wl) != "" {
-						out = append(out, assistantStyle.Render("● ")+wl)
-						dotPlaced = true
-					} else {
-						out = append(out, wl)
-					}
+			for _, physical := range streamLines {
+				if !dotPlaced && strings.TrimSpace(physical) != "" {
+					out = append(out, assistantStyle.Render("● ")+physical)
+					dotPlaced = true
+				} else {
+					out = append(out, physical)
 				}
 			}
 		case "diff":
@@ -1835,6 +1786,7 @@ func renderMarkdown(text string, width int) string {
 	}
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStandardStyle("dark"),
+		glamour.WithStylesFromJSONBytes([]byte(`{"code":{"prefix":" ","suffix":" ","color":"75","background_color":null},"code_block":{"chroma":{"error":{"color":"#7AABFF","background_color":null}}}}`)),
 		glamour.WithWordWrap(w),
 	)
 	if err != nil {
@@ -2008,7 +1960,19 @@ func (m *model) clampScroll() {
 	}
 }
 
+func (m *model) isAtBottom() bool {
+	rendered := m.renderedLines()
+	maxScroll := len(rendered) - m.chatRows()
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	return m.scroll >= maxScroll
+}
+
 func (m *model) scrollToBottom() {
+	if m.userScrolled {
+		return
+	}
 	rendered := m.renderedLines()
 	m.scroll = len(rendered) - m.chatRows()
 	m.clampScroll()
@@ -2057,60 +2021,6 @@ func shortModel(model string) string {
 	default:
 		return model
 	}
-}
-
-// applyProviderMeta switches the model to a provider's default model.
-func (m *model) applyProviderMeta(p provider.ProviderMeta) {
-	m.providerOverride = p.Prov
-	if p.Prov == nil {
-		m.modelOverride = provider.DefaultModel()
-	} else {
-		m.modelOverride = p.Prov.DefaultModel()
-	}
-	m.modelName = m.modelOverride
-	saveDefaultModelProvider(m.modelOverride, m.providerOverride)
-	m.lines = append(m.lines, line{Kind: "tool",
-		Text: "switched to " + p.Label + " · " + shortModel(m.modelOverride)})
-}
-
-// applyModelMeta switches to a specific model on a specific provider.
-func (m *model) applyModelMeta(mm provider.ModelMeta) {
-	m.providerOverride = mm.Provider.Prov
-	m.modelOverride = mm.FullName
-	m.modelName = mm.FullName
-	saveDefaultModelProvider(mm.FullName, mm.Provider.Prov)
-	m.lines = append(m.lines, line{Kind: "tool",
-		Text: "switched to " + mm.Provider.Label + " · " + shortModel(mm.FullName)})
-}
-
-// currentProviderID maps the active provider override back to a catalog id.
-func currentProviderID(p provider.Provider) string {
-	switch p {
-	case provider.Kimi:
-		return "kimi"
-	case provider.MiniMax:
-		return "minimax"
-	default:
-		return "claude"
-	}
-}
-
-func findProviderMetaByID(id string) (provider.ProviderMeta, bool) {
-	for _, p := range provider.Providers() {
-		if p.ID == id {
-			return p, true
-		}
-	}
-	return provider.ProviderMeta{}, false
-}
-
-func findModelMetaBySlug(slug string) (provider.ModelMeta, bool) {
-	for _, mm := range provider.Models() {
-		if mm.ID == slug {
-			return mm, true
-		}
-	}
-	return provider.ModelMeta{}, false
 }
 
 func saveDefaultModelProvider(modelOverride string, prov provider.Provider) {
@@ -2357,10 +2267,9 @@ func (m *model) executeSlash(cmd string, args []string) {
 	case "model":
 		if len(args) == 0 {
 			m.modelList = provider.Models()
-			// Pre-select the active model so the user lands on it.
 			cur := m.modelName
-			if cur == "" {
-				cur = m.providerOverride.DefaultModel()
+			if m.modelOverride != "" {
+				cur = m.modelOverride
 			}
 			for i, mm := range m.modelList {
 				if mm.FullName == cur {
@@ -2751,6 +2660,62 @@ func (m *model) renderSessionBrowser() string {
 	return b.String()
 }
 
+// applyProviderMeta switches the model to a provider's default model.
+func (m *model) applyProviderMeta(p provider.ProviderMeta) {
+	m.providerOverride = p.Prov
+	if p.Prov == nil {
+		m.modelOverride = provider.DefaultModel()
+	} else {
+		m.modelOverride = p.Prov.DefaultModel()
+	}
+	m.modelName = m.modelOverride
+	saveDefaultModelProvider(m.modelOverride, m.providerOverride)
+	m.lines = append(m.lines, line{Kind: "tool",
+		Text: "switched to " + p.Label + " · " + shortModel(m.modelOverride)})
+	m.bumpCache()
+}
+
+// applyModelMeta switches to a specific model on a specific provider.
+func (m *model) applyModelMeta(mm provider.ModelMeta) {
+	m.providerOverride = mm.Provider.Prov
+	m.modelOverride = mm.FullName
+	m.modelName = mm.FullName
+	saveDefaultModelProvider(mm.FullName, mm.Provider.Prov)
+	m.lines = append(m.lines, line{Kind: "tool",
+		Text: "switched to " + mm.Provider.Label + " · " + shortModel(mm.FullName)})
+	m.bumpCache()
+}
+
+// currentProviderID maps the active provider override back to a catalog id.
+func currentProviderID(p provider.Provider) string {
+	switch p {
+	case provider.Kimi:
+		return "kimi"
+	case provider.MiniMax:
+		return "minimax"
+	default:
+		return "claude"
+	}
+}
+
+func findProviderMetaByID(id string) (provider.ProviderMeta, bool) {
+	for _, p := range provider.Providers() {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return provider.ProviderMeta{}, false
+}
+
+func findModelMetaBySlug(slug string) (provider.ModelMeta, bool) {
+	for _, mm := range provider.Models() {
+		if mm.ID == slug {
+			return mm, true
+		}
+	}
+	return provider.ModelMeta{}, false
+}
+
 // renderProviderPicker renders the full-screen provider picker.
 func (m *model) renderProviderPicker() string {
 	if m.providerList == nil {
@@ -2762,7 +2727,7 @@ func (m *model) renderProviderPicker() string {
 	b.WriteString(header)
 	b.WriteString("\n")
 
-	bodyRows := m.height - 2 // header + footer
+	bodyRows := m.height - 2
 	if bodyRows < 1 {
 		bodyRows = 1
 	}
@@ -2809,13 +2774,13 @@ func (m *model) renderModelPicker() string {
 	b.WriteString(header)
 	b.WriteString("\n")
 
-	bodyRows := m.height - 2 // header + footer
+	bodyRows := m.height - 2
 	if bodyRows < 1 {
 		bodyRows = 1
 	}
 
 	curFull := m.modelName
-	if curFull == "" {
+	if curFull == "" && m.providerOverride != nil {
 		curFull = m.providerOverride.DefaultModel()
 	}
 	for i, mm := range m.modelList {
