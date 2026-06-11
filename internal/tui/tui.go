@@ -37,25 +37,28 @@ type streamMsg struct {
 }
 
 type turnDoneMsg struct {
-	Messages []provider.Message
-	Err      error
-	Usage    provider.Usage
+	Messages   []provider.Message
+	Err        error
+	Usage      provider.Usage
+	RetryCount int
 }
 
 type tickMsg time.Time
 
 const (
-	modeChat    = 0
-	modeDiff    = 1
-	modeSession = 2
+	modeChat = iota
+	modeDiff
+	modeSession
+	modeProviderPicker
+	modeModelPicker
 )
 
 type slashDef struct{ cmd, args, desc string }
 
 var slashDefs = []slashDef{
 	{"clear", "", "Clear the chat"},
-	{"model", "[haiku|sonnet|opus]", "Switch Claude model"},
-	{"provider", "[kimi|minimax]", "Switch provider"},
+	{"model", "", "Switch model (picker)"},
+	{"provider", "", "Switch provider (picker)"},
 	{"usage", "", "Show token usage"},
 	{"help", "", "List commands"},
 	{"new", "", "Start a new session"},
@@ -152,6 +155,14 @@ type model struct {
 	// session browser
 	sessionList   []store.SessionSummary
 	sessionScroll int
+
+	// provider picker
+	providerList   []provider.ProviderMeta
+	providerPickIdx int
+
+	// model picker (flat list across all providers)
+	modelList    []provider.ModelMeta
+	modelPickIdx int
 
 	// text selection
 	selActive bool   // mouse button held
@@ -287,10 +298,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.allToolLines = append(m.allToolLines, summary)
 			m.reading = nil
 		}
-		// Promote streaming assistant lines to permanent (triggers full glamour render).
-		for i, l := range m.lines {
-			if l.Kind == "assistant_stream" {
-				m.lines[i].Kind = "assistant"
+		// Flush any pending streamText before touching streaming lines.
+		m.replaceStreamingAssistant()
+		// Decide whether this turn will be retried before touching streaming lines.
+		_, isStuckCheck := agent.IsStuck(msg.Err)
+		willRetry := msg.Err != nil && !isStuckCheck && msg.RetryCount < 5
+		if willRetry {
+			// Strip partial streaming lines — the retry will render a fresh stream.
+			filtered := m.lines[:0]
+			for _, l := range m.lines {
+				if l.Kind != "assistant_stream" {
+					filtered = append(filtered, l)
+				}
+			}
+			m.lines = filtered
+		} else {
+			// Promote streaming assistant lines to permanent (triggers full glamour render).
+			for i, l := range m.lines {
+				if l.Kind == "assistant_stream" {
+					m.lines[i].Kind = "assistant"
+				}
 			}
 		}
 		m.running = false
@@ -341,6 +368,36 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}, retryPrompt, beforeMsgs)
 					if m.program != nil {
 						m.program.Send(turnDoneMsg{Messages: next, Err: err, Usage: provider.LastUsage()})
+					}
+				}()
+			} else if msg.RetryCount < 5 {
+				m.lines = append(m.lines, line{Kind: "tool", Text: fmt.Sprintf("stream dropped, retrying (%d/5)…", msg.RetryCount+1)})
+				m.running = true
+				ctx, cancel := context.WithCancel(context.Background())
+				m.cancel = cancel
+				sess := m.session
+				cwd := m.cwd
+				modelName := m.modelName
+				providerOverride := m.providerOverride
+				lastPrompt := m.lastPrompt
+				beforeMsgs := m.beforeMessages
+				retryCount := msg.RetryCount
+				cb := func(eventType string, data map[string]any) {
+					if m.program != nil {
+						m.program.Send(streamMsg{Event: eventType, Data: data})
+					}
+				}
+				go func() {
+					next, err := agent.AgentTurn(ctx, agent.AgentConfig{
+						CWD:      cwd,
+						Session:  sess,
+						MaxSteps: 25,
+						StreamCB: cb,
+						Model:    modelName,
+						Provider: providerOverride,
+					}, lastPrompt, beforeMsgs)
+					if m.program != nil {
+						m.program.Send(turnDoneMsg{Messages: next, Err: err, Usage: provider.LastUsage(), RetryCount: retryCount + 1})
 					}
 				}()
 			} else {
@@ -618,6 +675,76 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.mode = modeChat
 				m.bumpCache()
 				m.scrollToBottom()
+			}
+		}
+		return m, nil
+	}
+
+	// ── Provider picker mode ─────────────────────────────────────────────────
+	if m.mode == modeProviderPicker {
+		switch msg.Type {
+		case tea.KeyCtrlD:
+			return m, tea.Quit
+		case tea.KeyCtrlC, tea.KeyEsc:
+			m.mode = modeChat
+		case tea.KeyUp:
+			if m.providerPickIdx > 0 {
+				m.providerPickIdx--
+			}
+		case tea.KeyDown:
+			if m.providerPickIdx < len(m.providerList)-1 {
+				m.providerPickIdx++
+			}
+		case tea.KeyEnter:
+			if len(m.providerList) > 0 {
+				p := m.providerList[m.providerPickIdx]
+				if p.EnvVar != "" && os.Getenv(p.EnvVar) == "" {
+					m.awaitingKey = p.EnvVar
+					m.lines = append(m.lines, line{Kind: "tool",
+						Text: "Enter " + p.EnvVar + " (will be saved to config):"})
+					m.mode = modeChat
+					m.bumpCache()
+					m.scrollToBottom()
+					return m, nil
+				}
+				m.applyProviderMeta(p)
+				m.mode = modeChat
+				m.bumpCache()
+			}
+		}
+		return m, nil
+	}
+
+	// ── Model picker mode ────────────────────────────────────────────────────
+	if m.mode == modeModelPicker {
+		switch msg.Type {
+		case tea.KeyCtrlD:
+			return m, tea.Quit
+		case tea.KeyCtrlC, tea.KeyEsc:
+			m.mode = modeChat
+		case tea.KeyUp:
+			if m.modelPickIdx > 0 {
+				m.modelPickIdx--
+			}
+		case tea.KeyDown:
+			if m.modelPickIdx < len(m.modelList)-1 {
+				m.modelPickIdx++
+			}
+		case tea.KeyEnter:
+			if len(m.modelList) > 0 {
+				mm := m.modelList[m.modelPickIdx]
+				if mm.Provider.EnvVar != "" && os.Getenv(mm.Provider.EnvVar) == "" {
+					m.awaitingKey = mm.Provider.EnvVar
+					m.lines = append(m.lines, line{Kind: "tool",
+						Text: "Enter " + mm.Provider.EnvVar + " (will be saved to config):"})
+					m.mode = modeChat
+					m.bumpCache()
+					m.scrollToBottom()
+					return m, nil
+				}
+				m.applyModelMeta(mm)
+				m.mode = modeChat
+				m.bumpCache()
 			}
 		}
 		return m, nil
@@ -1013,6 +1140,12 @@ func (m *model) View() string {
 	// ── Session browser mode ─────────────────────────────────────────────────
 	if m.mode == modeSession {
 		return m.renderSessionBrowser()
+	}
+	if m.mode == modeProviderPicker {
+		return m.renderProviderPicker()
+	}
+	if m.mode == modeModelPicker {
+		return m.renderModelPicker()
 	}
 
 	// ── Chat mode ────────────────────────────────────────────────────────────
@@ -1926,6 +2059,60 @@ func shortModel(model string) string {
 	}
 }
 
+// applyProviderMeta switches the model to a provider's default model.
+func (m *model) applyProviderMeta(p provider.ProviderMeta) {
+	m.providerOverride = p.Prov
+	if p.Prov == nil {
+		m.modelOverride = provider.DefaultModel()
+	} else {
+		m.modelOverride = p.Prov.DefaultModel()
+	}
+	m.modelName = m.modelOverride
+	saveDefaultModelProvider(m.modelOverride, m.providerOverride)
+	m.lines = append(m.lines, line{Kind: "tool",
+		Text: "switched to " + p.Label + " · " + shortModel(m.modelOverride)})
+}
+
+// applyModelMeta switches to a specific model on a specific provider.
+func (m *model) applyModelMeta(mm provider.ModelMeta) {
+	m.providerOverride = mm.Provider.Prov
+	m.modelOverride = mm.FullName
+	m.modelName = mm.FullName
+	saveDefaultModelProvider(mm.FullName, mm.Provider.Prov)
+	m.lines = append(m.lines, line{Kind: "tool",
+		Text: "switched to " + mm.Provider.Label + " · " + shortModel(mm.FullName)})
+}
+
+// currentProviderID maps the active provider override back to a catalog id.
+func currentProviderID(p provider.Provider) string {
+	switch p {
+	case provider.Kimi:
+		return "kimi"
+	case provider.MiniMax:
+		return "minimax"
+	default:
+		return "claude"
+	}
+}
+
+func findProviderMetaByID(id string) (provider.ProviderMeta, bool) {
+	for _, p := range provider.Providers() {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return provider.ProviderMeta{}, false
+}
+
+func findModelMetaBySlug(slug string) (provider.ModelMeta, bool) {
+	for _, mm := range provider.Models() {
+		if mm.ID == slug {
+			return mm, true
+		}
+	}
+	return provider.ModelMeta{}, false
+}
+
 func saveDefaultModelProvider(modelOverride string, prov provider.Provider) {
 	cfg, err := config.Load()
 	if err != nil {
@@ -2169,74 +2356,63 @@ func (m *model) executeSlash(cmd string, args []string) {
 
 	case "model":
 		if len(args) == 0 {
+			m.modelList = provider.Models()
+			// Pre-select the active model so the user lands on it.
 			cur := m.modelName
-			if m.modelOverride != "" {
-				cur = m.modelOverride
+			if cur == "" {
+				cur = m.providerOverride.DefaultModel()
 			}
-			m.lines = append(m.lines, line{Kind: "tool",
-				Text: fmt.Sprintf("current model: %s\nset with: /model haiku  /model sonnet  /model opus", shortModel(cur))})
+			for i, mm := range m.modelList {
+				if mm.FullName == cur {
+					m.modelPickIdx = i
+					break
+				}
+			}
+			m.mode = modeModelPicker
 		} else {
-			switch args[0] {
-			case "haiku":
-				m.modelOverride = provider.ModelHaiku
-				m.providerOverride = nil
-			case "sonnet":
-				m.modelOverride = provider.ModelSonnet
-				m.providerOverride = nil
-			case "opus":
-				m.modelOverride = provider.ModelOpus
-				m.providerOverride = nil
-			default:
-				m.lines = append(m.lines, line{Kind: "error", Text: "unknown model: " + args[0] + "  (haiku|sonnet|opus)"})
+			mm, ok := findModelMetaBySlug(args[0])
+			if !ok {
+				m.lines = append(m.lines, line{Kind: "error", Text: "unknown model: " + args[0]})
 				m.bumpCache()
 				return
 			}
-			m.modelName = m.modelOverride
-			saveDefaultModelProvider(m.modelOverride, m.providerOverride)
-			m.lines = append(m.lines, line{Kind: "tool", Text: "switched to " + shortModel(m.modelOverride)})
+			if mm.Provider.EnvVar != "" && os.Getenv(mm.Provider.EnvVar) == "" {
+				m.awaitingKey = mm.Provider.EnvVar
+				m.lines = append(m.lines, line{Kind: "tool",
+					Text: "Enter " + mm.Provider.EnvVar + " (will be saved to config):"})
+				m.bumpCache()
+				return
+			}
+			m.applyModelMeta(mm)
 		}
 		m.bumpCache()
 
 	case "provider":
 		if len(args) == 0 {
-			cur := "claude"
-			if m.providerOverride == provider.Kimi {
-				cur = "kimi"
-			} else if m.providerOverride == provider.MiniMax {
-				cur = "minimax"
+			m.providerList = provider.Providers()
+			curID := currentProviderID(m.providerOverride)
+			for i, p := range m.providerList {
+				if p.ID == curID {
+					m.providerPickIdx = i
+					break
+				}
 			}
-			m.lines = append(m.lines, line{Kind: "tool",
-				Text: fmt.Sprintf("current provider: %s\nset with: /provider kimi  /provider minimax", cur)})
+			m.mode = modeProviderPicker
 		} else {
-			switch args[0] {
-			case "kimi":
-				envVar := provider.ProviderEnvVar("kimi")
-				if os.Getenv(envVar) == "" {
-					m.awaitingKey = envVar
-					m.lines = append(m.lines, line{Kind: "tool", Text: "Enter MOONSHOT_API_KEY (will be saved to config):"})
-					m.bumpCache()
-					return
-				}
-				m.providerOverride = provider.Kimi
-				m.modelOverride = provider.Kimi.DefaultModel()
-			case "minimax":
-				envVar := provider.ProviderEnvVar("minimax")
-				if os.Getenv(envVar) == "" {
-					m.awaitingKey = envVar
-					m.lines = append(m.lines, line{Kind: "tool", Text: "Enter MINIMAX_API_KEY (will be saved to config):"})
-					m.bumpCache()
-					return
-				}
-				m.providerOverride = provider.MiniMax
-				m.modelOverride = provider.MiniMax.DefaultModel()
-			default:
-				m.lines = append(m.lines, line{Kind: "error", Text: "unknown provider: " + args[0] + "  (kimi|minimax)"})
+			p, ok := findProviderMetaByID(args[0])
+			if !ok {
+				m.lines = append(m.lines, line{Kind: "error", Text: "unknown provider: " + args[0]})
 				m.bumpCache()
 				return
 			}
-			m.modelName = m.modelOverride
-			saveDefaultModelProvider(m.modelOverride, m.providerOverride)
-			m.lines = append(m.lines, line{Kind: "tool", Text: "switched to " + shortModel(m.modelOverride)})
+			if p.EnvVar != "" && os.Getenv(p.EnvVar) == "" {
+				m.awaitingKey = p.EnvVar
+				m.lines = append(m.lines, line{Kind: "tool",
+					Text: "Enter " + p.EnvVar + " (will be saved to config):"})
+				m.bumpCache()
+				return
+			}
+			m.applyProviderMeta(p)
 		}
 		m.bumpCache()
 
@@ -2570,6 +2746,103 @@ func (m *model) renderSessionBrowser() string {
 	}
 
 	footer := fmt.Sprintf(" %d / %d", m.sessionScroll+1, len(m.sessionList))
+	b.WriteString(sessionHeaderStyle.Width(m.width).Render(footer))
+
+	return b.String()
+}
+
+// renderProviderPicker renders the full-screen provider picker.
+func (m *model) renderProviderPicker() string {
+	if m.providerList == nil {
+		m.providerList = provider.Providers()
+	}
+
+	var b strings.Builder
+	header := sessionHeaderStyle.Width(m.width).Render(" providers   ↑/↓ scroll · Enter select · Esc back")
+	b.WriteString(header)
+	b.WriteString("\n")
+
+	bodyRows := m.height - 2 // header + footer
+	if bodyRows < 1 {
+		bodyRows = 1
+	}
+
+	curID := currentProviderID(m.providerOverride)
+	for i, p := range m.providerList {
+		row := fmt.Sprintf(" %-10s", p.Label)
+		if p.ID == curID {
+			row += "  ← current"
+		}
+		if p.EnvVar != "" && os.Getenv(p.EnvVar) == "" {
+			row += fmt.Sprintf("  [needs %s]", p.EnvVar)
+		}
+		if len([]rune(row)) > m.width {
+			row = string([]rune(row)[:max(1, m.width-1)]) + "…"
+		}
+		if i == m.providerPickIdx {
+			b.WriteString(sessionSelStyle.Width(m.width).Render(row))
+		} else {
+			b.WriteString(sessionRowStyle.Width(m.width).Render(row))
+		}
+		b.WriteString("\n")
+	}
+
+	for rendered := len(m.providerList); rendered < bodyRows; rendered++ {
+		b.WriteString(sessionRowStyle.Width(m.width).Render(""))
+		b.WriteString("\n")
+	}
+
+	footer := fmt.Sprintf(" %d / %d", m.providerPickIdx+1, len(m.providerList))
+	b.WriteString(sessionHeaderStyle.Width(m.width).Render(footer))
+
+	return b.String()
+}
+
+// renderModelPicker renders the full-screen flat model picker.
+func (m *model) renderModelPicker() string {
+	if m.modelList == nil {
+		m.modelList = provider.Models()
+	}
+
+	var b strings.Builder
+	header := sessionHeaderStyle.Width(m.width).Render(" models   ↑/↓ scroll · Enter select · Esc back")
+	b.WriteString(header)
+	b.WriteString("\n")
+
+	bodyRows := m.height - 2 // header + footer
+	if bodyRows < 1 {
+		bodyRows = 1
+	}
+
+	curFull := m.modelName
+	if curFull == "" {
+		curFull = m.providerOverride.DefaultModel()
+	}
+	for i, mm := range m.modelList {
+		row := fmt.Sprintf(" %-10s  %s", mm.Provider.Label, mm.FullName)
+		if mm.FullName == curFull {
+			row += "  ← current"
+		}
+		if mm.Provider.EnvVar != "" && os.Getenv(mm.Provider.EnvVar) == "" {
+			row += fmt.Sprintf("  [needs %s]", mm.Provider.EnvVar)
+		}
+		if len([]rune(row)) > m.width {
+			row = string([]rune(row)[:max(1, m.width-1)]) + "…"
+		}
+		if i == m.modelPickIdx {
+			b.WriteString(sessionSelStyle.Width(m.width).Render(row))
+		} else {
+			b.WriteString(sessionRowStyle.Width(m.width).Render(row))
+		}
+		b.WriteString("\n")
+	}
+
+	for rendered := len(m.modelList); rendered < bodyRows; rendered++ {
+		b.WriteString(sessionRowStyle.Width(m.width).Render(""))
+		b.WriteString("\n")
+	}
+
+	footer := fmt.Sprintf(" %d / %d", m.modelPickIdx+1, len(m.modelList))
 	b.WriteString(sessionHeaderStyle.Width(m.width).Render(footer))
 
 	return b.String()
