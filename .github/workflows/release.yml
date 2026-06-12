@@ -29,10 +29,10 @@ jobs:
 
     - name: Build release binaries
       run: |
-        VERSION=${GITHUB_REF#refs/tags/}
+        VERSION=$(git describe --tags --long HEAD)
         COMMIT=$(git rev-parse --short HEAD)
         BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-        LDFLAGS="-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.buildDate=$BUILD_DATE"
+        LDFLAGS="-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.buildDate=$BUILD_DATE -X github.com/trymimicode/mimicode-go/internal/version.Build=$VERSION"
         
         # Linux amd64
         GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o mimicode-linux-amd64 ./cmd/mimicode

@@ -22,6 +22,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/trymimicode/mimicode-go/internal/agent"
+	"github.com/trymimicode/mimicode-go/internal/version"
 	"github.com/trymimicode/mimicode-go/internal/compactor"
 	"github.com/trymimicode/mimicode-go/internal/config"
 	"github.com/trymimicode/mimicode-go/internal/recovery"
@@ -214,6 +215,7 @@ var (
 	diffHintStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(lipgloss.Color("235"))
 
 	// slash menu
+	versionStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	slashMenuBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Background(lipgloss.Color("234"))
 	slashItemStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("234")).PaddingLeft(2)
 	slashItemSelStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("237")).Bold(true).PaddingLeft(1)
@@ -1208,6 +1210,10 @@ func (m *model) View() string {
 	b.WriteString(statusStyle.Width(max(1, m.width)).Render(status))
 	b.WriteString("\n")
 
+	// Version bar
+	b.WriteString(versionStyle.Render(" " + version.String()))
+	b.WriteString("\n")
+
 	// Input area
 	prompt := "> "
 	inputDisplay, dispCursor := m.inputDisplay()
@@ -2076,7 +2082,7 @@ func (m *model) chatRows() int {
 	if m.height <= 4 {
 		return 5
 	}
-	reserved := 2 // status bar + input
+	reserved := 3 // status bar + version bar + input
 	if len(m.changedFiles) > 0 {
 		reserved++
 	}
