@@ -292,6 +292,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamMsg:
 		m.handleStream(msg)
 	case turnDoneMsg:
+		// Flush any buffered stream text before promoting the line.
+		m.replaceStreamingAssistant()
 		// If reading was still animating, finalize it now.
 		if m.reading != nil {
 			summary := line{Kind: "tool", Text: fmt.Sprintf("read %s (%d lines)", filepath.Base(m.reading.path), len(m.reading.lines))}
@@ -1405,12 +1407,10 @@ func (m *model) replaceStreamingAssistant() {
 	if m.streamText == "" {
 		return
 	}
-	for i := len(m.lines) - 1; i >= 0; i-- {
-		if m.lines[i].Kind == "assistant_stream" {
-			m.lines[i].Text = m.streamText
-			m.bumpCache()
-			return
-		}
+	if len(m.lines) > 0 && m.lines[len(m.lines)-1].Kind == "assistant_stream" {
+		m.lines[len(m.lines)-1].Text = m.streamText
+		m.bumpCache()
+		return
 	}
 	m.lines = append(m.lines, line{Kind: "assistant_stream", Text: m.streamText})
 	m.bumpCache()
